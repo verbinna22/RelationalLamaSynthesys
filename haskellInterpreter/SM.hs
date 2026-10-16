@@ -20,8 +20,7 @@ data Value
   | VString Int
   | VArray  Int
   | VSexp   String Int
-  | VVar    Designation
-  | VClosure String [Value]
+  | VClosure String Int
   | VBuiltin String
   | VEmpty
   deriving (Show, Eq)
@@ -32,9 +31,7 @@ data Insn
   | STRING String
   | SEXP String Int
   | LD Designation
-  | LDA Designation
   | ST Designation
-  | STI
   | STA
   | ELEM
   | LABEL String
@@ -61,16 +58,16 @@ type Prog = [Insn]
 data Loc = Loc
   { locArgs    :: IM.IntMap Value
   , locLocals  :: IM.IntMap Value
-  , locClosure :: IM.IntMap Value
+  , locClosure :: Maybe (IM.IntMap Value)
   } deriving Show
 
 emptyLoc :: Loc
-emptyLoc = Loc IM.empty IM.empty IM.empty
+emptyLoc = Loc IM.empty IM.empty Nothing
 
 type Store = IM.IntMap [Value]
 
 data Config = Config
-  { cstack :: [(Prog, Loc)]
+  { cstack :: [(Prog, Loc, [Value])]
   , stk    :: [Value]
   , glob   :: M.Map String Value
   , loc    :: Loc
@@ -137,10 +134,10 @@ binopFunc "-"  a b = pure (a - b)
 binopFunc "*"  a b = pure (a * b)
 binopFunc "/"  a b
   | b == 0    = throwSM "division by zero"
-  | otherwise = pure (a `div` b)
+  | otherwise = pure (a `quot` b)
 binopFunc "%"  a b
   | b == 0    = throwSM "modulo by zero"
-  | otherwise = pure (a `mod` b)
+  | otherwise = pure (a `rem` b)
 binopFunc "<"  a b = pure (b2i (a <  b))
 binopFunc "<=" a b = pure (b2i (a <= b))
 binopFunc ">"  a b = pure (b2i (a >  b))
@@ -161,7 +158,7 @@ lookupDesignation _ l (DLocal  i) = case IM.lookup i (locLocals l) of
 lookupDesignation _ l (DArg    i) = case IM.lookup i (locArgs l) of
   Just v  -> pure v
   Nothing -> throwSM ("unbound argument: " ++ show i)
-lookupDesignation _ l (DAccess i) = case IM.lookup i (locClosure l) of
+lookupDesignation _ l (DAccess i) = case (locClosure l >>= IM.lookup i) of
   Just v  -> pure v
   Nothing -> throwSM ("unbound closure slot: " ++ show i)
 
@@ -170,7 +167,7 @@ updateDesignation :: M.Map String Value -> Loc -> Value -> Designation
 updateDesignation g l v (DGlobal s) = (M.insert s v g, l)
 updateDesignation g l v (DLocal  i) = (g, l { locLocals  = IM.insert i v (locLocals  l) })
 updateDesignation g l v (DArg    i) = (g, l { locArgs    = IM.insert i v (locArgs    l) })
-updateDesignation g l v (DAccess i) = (g, l { locClosure = IM.insert i v (locClosure l) })
+updateDesignation g l v (DAccess i) = (g, l { locClosure = fmap (IM.insert i v) (locClosure l) })
 
 allocStore :: [Value] -> Config -> (Int, Config)
 allocStore vs c =
@@ -206,9 +203,8 @@ showValue s (VArray i)  = case IM.lookup i s of
 showValue s (VSexp t i) = case IM.lookup i s of
   Nothing -> "<" ++ t ++ "#?>"
   Just vs -> "(" ++ unwords (t : map (showValue s) vs) ++ ")"
-showValue s (VVar d)       = "&" ++ show d
 showValue s (VClosure n _) = "<closure " ++ n ++ ">"
-showValue s (VBuiltin n)   = "<builtin " ++ n ++ ">"
+showValue _ (VBuiltin n)   = "<builtin " ++ n ++ ">"
 showValue s VEmpty         = "<empty>"
 
 builtin :: String -> [Value] -> Config -> SM Config
@@ -253,7 +249,7 @@ step env conf (insn : rest) = case insn of
         (i, conf') = allocStore vs conf
     pure (conf' { stk = VString i : stk conf }, rest)
 
-  SEXP (tag, n) -> do
+  SEXP tag n -> do
     (vs, rest') <- splitStack n (stk conf)
     let (i, conf') = allocStore (reverse vs) conf
     pure (conf' { stk = VSexp tag i : rest' }, rest)
@@ -283,25 +279,14 @@ step env conf (insn : rest) = case insn of
     v <- lookupDesignation (glob conf) (loc conf) x
     pure (conf { stk = v : stk conf }, rest)
 
-  LDA x -> pure (conf { stk = VVar x : stk conf }, rest)
-
   ST x -> case stk conf of
     (z : rest') -> do
       let (g', l') = updateDesignation (glob conf) (loc conf) z x
       pure (conf { stk = z : rest', glob = g', loc = l' }, rest)
     _ -> throwSM "ST: stack underflow"
 
-  STI -> case stk conf of
-    (z : VVar r : rest') -> do
-      let (g', l') = updateDesignation (glob conf) (loc conf) z r
-      pure (conf { stk = z : rest', glob = g', loc = l' }, rest)
-    _ -> throwSM "STI: bad stack shape"
-
   STA -> case stk conf of
     (z : j : rest') -> case j of
-      VVar r -> do
-        let (g', l') = updateDesignation (glob conf) (loc conf) z r
-        pure (conf { stk = z : rest', glob = g', loc = l' }, rest)
       VInt _ -> case rest' of
         (container : rest'') -> do
           i <- fromIntegral <$> toInt j
@@ -329,7 +314,7 @@ step env conf (insn : rest) = case insn of
     p <- jumpTo env l
     pure (conf, p)
 
-  CJMP (c, l) -> case stk conf of
+  CJMP c l -> case stk conf of
     (x : rest') -> do
       n <- toInt x
       let take_ = (c == "z" && n == 0) || (c == "nz" && n /= 0)
@@ -341,19 +326,20 @@ step env conf (insn : rest) = case insn of
           pure (conf { stk = rest' }, rest)
     _ -> throwSM "CJMP: stack underflow"
 
-  CLOSURE (name, dgs) -> do
+  CLOSURE name dgs -> do
     cl <- mapM (capture (loc conf)) dgs
-    pure (conf { stk = VClosure name cl : stk conf }, rest)
+    let (ident, conf') = allocStore cl conf
+    pure (conf' { stk = VClosure name ident : stk conf }, rest)
 
-  CALL (f, n) -> do
+  CALL f n -> do
     (args, rest') <- splitStack n (stk conf)
     case M.lookup f env of
       Just body -> do
         let argsMap = IM.fromList (zip [0..] (reverse args))
         let newLoc = Loc { locArgs    = argsMap
                          , locLocals  = IM.empty
-                         , locClosure = IM.empty }
-        pure (conf { cstack = (rest, loc conf) : cstack conf
+                         , locClosure = Nothing }
+        pure (conf { cstack = (rest, loc conf, rest') : cstack conf
                    , stk    = rest'
                    , loc    = newLoc }, body)
       Nothing -> do
@@ -363,13 +349,14 @@ step env conf (insn : rest) = case insn of
   CALLC n -> do
     (vs, rest') <- splitStack (n + 1) (stk conf)
     case reverse vs of
-      (VClosure name cl : args) -> do
+      (VClosure name ident : args) -> do
+        cl <- lookupStore ident conf
         let argsMap = IM.fromList (zip [0..] args)
         let newLoc = Loc { locArgs    = argsMap
                          , locLocals  = IM.empty
-                         , locClosure = IM.fromList (zip [0..] cl) }
+                         , locClosure = Just (IM.fromList (zip [0..] cl)) }
         p <- jumpTo env name
-        pure (conf { cstack = (rest, loc conf) : cstack conf
+        pure (conf { cstack = (rest, loc conf, rest') : cstack conf
                    , stk    = rest'
                    , loc    = newLoc }, p)
       (VBuiltin name : args) -> do
@@ -383,11 +370,11 @@ step env conf (insn : rest) = case insn of
     pure (conf { loc = (loc conf) { locLocals = localsMap } }, rest)
 
   END -> case cstack conf of
-    ((p, l) : cs) -> pure (conf { cstack = cs, loc = l }, p)
+    ((p, l, _) : cs) -> pure (conf { cstack = cs, loc = l }, p)
     []            -> pure (conf, [])
 
   RET -> case cstack conf of
-    ((p, l) : cs) -> pure (conf { cstack = cs, loc = l }, p)
+    ((p, l, _) : cs) -> pure (conf { cstack = cs, loc = l }, p)
     []            -> pure (conf, [])
 
   DROP -> case stk conf of
@@ -402,7 +389,7 @@ step env conf (insn : rest) = case insn of
     (x : y : rest') -> pure (conf { stk = y : x : rest' }, rest)
     _               -> throwSM "SWAP: stack underflow"
 
-  TAG (t, n) -> case stk conf of
+  TAG t n -> case stk conf of
     (x : rest') -> do
       v <- case x of
              VSexp t' id | t' == t -> do
@@ -478,7 +465,7 @@ capture :: Loc -> Designation -> SM Value
 capture l = \case
   DArg    i -> maybe (throwSM ("CLOSURE: bad arg "    ++ show i)) pure (IM.lookup i (locArgs    l))
   DLocal  i -> maybe (throwSM ("CLOSURE: bad local "  ++ show i)) pure (IM.lookup i (locLocals  l))
-  DAccess i -> maybe (throwSM ("CLOSURE: bad access " ++ show i)) pure (IM.lookup i (locClosure l))
+  DAccess i -> maybe (throwSM ("CLOSURE: bad access " ++ show i)) pure ((locClosure l >>= IM.lookup i))
   _         -> throwSM "CLOSURE: bad designation"
 
 eval :: LabelEnv -> Config -> Prog -> SM Config

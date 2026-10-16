@@ -123,6 +123,7 @@ data InterpError
   | UnknownBuiltin String
   | StackUnderflow
   | DivisionByZero
+  | DivisionOverflow
   | WriteToLiteral
   | WriteToRegister String
   | InvalidElement Int Int
@@ -131,6 +132,26 @@ data InterpError
   deriving (Show, Eq)
 
 type Interp a = Either InterpError a
+
+-- RDX is the signed high half; RAX contributes its unsigned 64-bit pattern.
+signedDivide128 :: Int -> Int -> Int -> Interp (Int, Int)
+signedDivide128 highHalf lowHalf divisor
+  | divisor == 0 = Left DivisionByZero
+  | quotient < negate signedLimit || quotient >= signedLimit = Left DivisionOverflow
+  | otherwise = Right (fromInteger quotient, fromInteger remainder)
+  where
+    registerBase :: Integer
+    registerBase = 2 ^ (64 :: Int)
+
+    signedLimit :: Integer
+    signedLimit = 2 ^ (63 :: Int)
+
+    dividend :: Integer
+    dividend = toInteger highHalf * registerBase + toInteger lowHalf `mod` registerBase
+
+    quotient :: Integer
+    remainder :: Integer
+    (quotient, remainder) = dividend `quotRem` toInteger divisor
 
 initialState :: ProgConfig -> [Int] -> State
 initialState _ inputs = State
@@ -236,6 +257,20 @@ popN n st = do
           st { stRegs  = M.insert RSP (rsp + n * 8) (stRegs st)
              , stStack = Stack (foldr M.delete cells adrs) } )
 
+popTwo :: State -> Interp ((Int, Int), State)
+popTwo initialState = do
+  (values, remainingState) <- popN 2 initialState
+  case values of
+    [firstValue, secondValue] -> pure ((firstValue, secondValue), remainingState)
+    _ -> Left StackUnderflow
+
+popThree :: State -> Interp ((Int, Int, Int), State)
+popThree initialState = do
+  (values, remainingState) <- popN 3 initialState
+  case values of
+    [firstValue, secondValue, thirdValue] -> pure ((firstValue, secondValue, thirdValue), remainingState)
+    _ -> Left StackUnderflow
+
 pushN :: [Int] -> State -> State
 pushN vs st =
   let rsp   = rspOf st
@@ -252,19 +287,19 @@ nargsOf st = M.findWithDefault 0 R11 (stRegs st)
 dispatchBuiltin :: ProgConfig -> String -> State -> Interp State
 dispatchBuiltin cfg name st0 = case name of
   ".string" -> do
-    ([adr], st) <- popN 1 st0
+    (adr, st) <- stackPop st0
     s <- readConst cfg adr
     let (newAdr, st') = alloc (MemString s) st
     Right (pushN [newAdr] st')
 
   "string" -> do
-    ([adr], st) <- popN 1 st0
+    (adr, st) <- stackPop st0
     s <- readConst cfg adr
     let (newAdr, st') = alloc (MemString s) st
     Right (pushN [newAdr] st')
 
   ".elem" -> do
-    ([idx, arr], st) <- popN 2 st0
+    ((idx, arr), st) <- popTwo st0
     o <- readMem arr st
     case o of
       MemArray xs
@@ -303,7 +338,7 @@ dispatchBuiltin cfg name st0 = case name of
       [] -> Left StackUnderflow
 
   ".array_patt" -> do
-    ([n, adr], st) <- popN 2 st0
+    ((n, adr), st) <- popTwo st0
     o <- readMem adr st
     let v = case o of
               MemArray xs | length xs == n -> 1
@@ -311,7 +346,7 @@ dispatchBuiltin cfg name st0 = case name of
     Right (pushN [v] st)
 
   ".string_patt" -> do
-    ([x, y], st) <- popN 2 st0
+    ((x, y), st) <- popTwo st0
     ox <- readMem x st
     oy <- readMem y st
     let v = case (ox, oy) of
@@ -327,7 +362,7 @@ dispatchBuiltin cfg name st0 = case name of
   ".closure_tag_patt" -> patt1 st0 (isClosure st0)
 
   ".sta" -> do
-    ([z, j, x], st) <- popN 3 st0
+    ((z, j, x), st) <- popThree st0
     o <- readMem x st
     case o of
       MemArray xs | j >= 0 && j < length xs ->
@@ -339,7 +374,7 @@ dispatchBuiltin cfg name st0 = case name of
       _ -> Right (pushN [z] st)
 
   "failure" -> do
-    ([msgAdr], st) <- popN 1 st0
+    (msgAdr, st) <- stackPop st0
     msg <- readMem msgAdr st >>= \case
              MemString s -> Right s
              _           -> Right ""
@@ -351,9 +386,10 @@ dispatchBuiltin cfg name st0 = case name of
 
   _ -> Left (UnknownBuiltin name)
   where
-    patt1 st f = do
-      ([x], st') <- popN 1 st
-      Right (pushN [if f x then 1 else 0] st')
+    patt1 :: State -> (Int -> Bool) -> Interp State
+    patt1 initialState predicate = do
+      (value, remainingState) <- stackPop initialState
+      Right (pushN [if predicate value then 1 else 0] remainingState)
 
     isArray   st a = case M.lookup a (stMem st) of Just (MemArray _)     -> True; _ -> False
     isString  st a = case M.lookup a (stMem st) of Just (MemString _)    -> True; _ -> False
@@ -391,16 +427,17 @@ step cfg st0 ((i, _dbg) : is) = case i of
       "test" -> Right (st0 { stFlags = flagsFromLogic (va .&. vb) }, is)
       _      -> Left (UnknownBuiltin ("binop " ++ op))
 
-  IDiv src -> do
-    v <- readInt st0 src
-    if v == 0 then Left DivisionByZero else do
-      let raxV = M.findWithDefault 0 RAX (stRegs st0)
-          rdxV = M.findWithDefault 0 RDX (stRegs st0)
-          dividend = (rdxV `shiftL` 64) .|. (raxV .&. 0xFFFFFFFFFFFFFFFF)
-          q = dividend `div` v
-          r = dividend `mod` v
-          st = st0 { stRegs = M.insert RAX q (M.insert RDX r (stRegs st0)) }
-      Right (st, is)
+  IDiv source -> do
+    divisor <- readInt st0 source
+    let lowHalf :: Int
+        lowHalf = M.findWithDefault 0 RAX (stRegs st0)
+        highHalf :: Int
+        highHalf = M.findWithDefault 0 RDX (stRegs st0)
+    (quotient, remainder) <- signedDivide128 highHalf lowHalf divisor
+    let dividedState :: State
+        dividedState = st0
+          { stRegs = M.insert RAX quotient (M.insert RDX remainder (stRegs st0)) }
+    Right (dividedState, is)
 
   Cltd -> do
     let raxV = M.findWithDefault 0 RAX (stRegs st0)
