@@ -76,7 +76,7 @@ data Config = Config
   , store  :: Store
   , nextId :: Int
   } deriving Show
-
+-- TODO: inefficiency
 initialConfig :: [Int] -> Config
 initialConfig i = Config
   { cstack = []
@@ -232,6 +232,10 @@ builtin "string" [v] c = do
       (i, c') = allocStore vs c
   pure c' { stk = VString i : stk c }
 builtin "string" args _ = throwSM ("string: bad args " ++ show args)
+
+builtin ".array" elements config =
+  let (arrayId, allocatedConfig) = allocStore elements config
+  in pure allocatedConfig { stk = VArray arrayId : stk allocatedConfig }
 
 builtin name _ _ = throwSM ("unknown builtin: " ++ name)
 

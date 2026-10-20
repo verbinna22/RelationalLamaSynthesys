@@ -4,7 +4,9 @@ module X86Interp where
 
 import qualified Data.Map.Strict as M
 import Data.Map.Strict (Map)
-import Data.Char (ord)
+import Data.Char (chr, ord)
+import Data.List (intercalate)
+import Numeric (showHex)
 import Data.Bits ((.&.), (.|.), xor, shiftL, shiftR, complement)
 import Data.Word (Word)
 import Control.Monad (foldM)
@@ -133,7 +135,6 @@ data InterpError
 
 type Interp a = Either InterpError a
 
--- RDX is the signed high half; RAX contributes its unsigned 64-bit pattern.
 signedDivide128 :: Int -> Int -> Int -> Interp (Int, Int)
 signedDivide128 highHalf lowHalf divisor
   | divisor == 0 = Left DivisionByZero
@@ -214,7 +215,23 @@ writeInt st op v = case op of
   R r   -> Right st { stRegs = M.insert r v (stRegs st) }
   S i   -> Right (stackWrite i v st)
   L _   -> Left WriteToLiteral
-  I _   -> Left (WriteToRegister "cannot write through indirect")
+  I offset -> writeClosureCapture st offset v
+
+writeClosureCapture :: State -> Int -> Int -> Interp State
+writeClosureCapture state byteOffset newValue
+  | byteOffset < 8 || byteOffset `mod` 8 /= 0 =
+      Left (RuntimeFailure ("Invalid closure capture offset: " ++ show byteOffset))
+  | otherwise = do
+      let closureAddress = M.findWithDefault 0 R15 (stRegs state)
+          captureIndex = byteOffset `div` 8 - 1
+      closure <- readMem closureAddress state
+      case closure of
+        MemClosure codeAddress capturedValues ->
+          case splitAt captureIndex capturedValues of
+            (prefix, _ : suffix) ->
+              writeMem closureAddress (MemClosure codeAddress (prefix ++ newValue : suffix)) state
+            _ -> Left (InvalidElement captureIndex (length capturedValues))
+        _ -> Left (InvalidMemoryAddress closureAddress)
 
 readAddr :: State -> Opnd -> Interp Int
 readAddr st op = case op of
@@ -284,117 +301,302 @@ pushN vs st =
 nargsOf :: State -> Int
 nargsOf st = M.findWithDefault 0 R11 (stRegs st)
 
+boxInteger :: Int -> Int
+boxInteger value = (value `shiftL` 1) .|. 1
+
+unboxInteger :: String -> Int -> Interp Int
+unboxInteger operationName value
+  | odd value = Right (value `shiftR` 1)
+  | otherwise = Left (RuntimeFailure (operationName ++ ": expected tagged integer"))
+
+noOpBuiltins :: [String]
+noOpBuiltins = ["__gc_init", "set_args", "Lbinoperror", "Lbinoperror2"]
+
+builtinSymbols :: [(String, String)]
+builtinSymbols =
+  [("Lread", "read"), ("Lwrite", "write"), ("Llength", "length"),
+   ("Btag", ".tag"), ("failure", "failure"),
+   ("Bstring", ".string"), ("Lstring", "string"), ("Belem", ".elem"),
+   ("Bsexp", ".sexp"), ("Barray", ".array"), ("Bclosure", ".closure"),
+   ("Barray_patt", ".array_patt"), ("Bstring_patt", ".string_patt"),
+   ("Bboxed_patt", ".boxed_patt"), ("Bunboxed_patt", ".unboxed_patt"),
+   ("Barray_tag_patt", ".array_tag_patt"), ("Bstring_tag_patt", ".string_tag_patt"),
+   ("Bsexp_tag_patt", ".sexp_tag_patt"), ("Bclosure_tag_patt", ".closure_tag_patt"),
+   ("Bsta", ".sta"), ("Lfailure", "failure"), ("Bmatch_failure", ".match_failure")]
+  ++ [(symbolName, symbolName) | symbolName <- noOpBuiltins]
+
 dispatchBuiltin :: ProgConfig -> String -> State -> Interp State
 dispatchBuiltin cfg name st0 = case name of
+  "read" -> case stInput st0 of
+    [] -> Left (RuntimeFailure "read: no input available")
+    inputValue : remainingInput ->
+      writeInt (st0 { stInput = remainingInput }) (R RAX) (boxInteger inputValue)
+
+  "write" -> do
+    argument <- readInt st0 (R RDI)
+    outputValue <- unboxInteger "write" argument
+    writeInt (st0 { stOutput = stOutput st0 ++ [outputValue] }) (R RAX) 0
+
+  "length" -> do
+    objectAddress <- readInt st0 (R RDI)
+    object <- readMem objectAddress st0
+    let objectLength = case object of
+          MemString characters -> length characters
+          MemArray elements -> length elements
+          MemSexp _ fields -> length fields
+          MemClosure _ captures -> 1 + length captures
+    writeInt st0 (R RAX) (boxInteger objectLength)
+
+  ".tag" -> do
+    value <- readInt st0 (R RDI)
+    expectedTag <- readInt st0 (R RSI)
+    encodedFieldCount <- readInt st0 (R RDX)
+    fieldCount <- unboxInteger ".tag field count" encodedFieldCount
+    _ <- unboxInteger ".tag tag" expectedTag
+    matches <- if odd value then Right False else do
+      object <- readMem value st0
+      pure (case object of
+        MemSexp actualTag fields -> actualTag == expectedTag && length fields == fieldCount
+        _ -> False)
+    writeInt st0 (R RAX) (boxInteger (if matches then 1 else 0))
+
   ".string" -> do
-    (adr, st) <- stackPop st0
-    s <- readConst cfg adr
-    let (newAdr, st') = alloc (MemString s) st
-    Right (pushN [newAdr] st')
+    sourceAddress <- readBuiltinArgument st0 0
+    characters <- readConst cfg sourceAddress
+    returnAllocated (MemString (takeWhile (/= '\0') characters)) st0
 
   "string" -> do
-    (adr, st) <- stackPop st0
-    s <- readConst cfg adr
-    let (newAdr, st') = alloc (MemString s) st
-    Right (pushN [newAdr] st')
+    value <- readBuiltinArgument st0 0
+    characters <- renderBuiltinValue st0 [] value
+    returnAllocated (MemString characters) st0
 
   ".elem" -> do
-    ((idx, arr), st) <- popTwo st0
-    o <- readMem arr st
-    case o of
-      MemArray xs
-        | idx >= 0 && idx < length xs -> Right (pushN [xs !! idx] st)
-        | otherwise -> Left (InvalidElement idx (length xs))
-      MemSexp _ xs
-        | idx >= 0 && idx < length xs -> Right (pushN [xs !! idx] st)
-        | otherwise -> Left (InvalidElement idx (length xs))
-      MemString s
-        | idx >= 0 && idx < length s  -> Right (pushN [ord (s !! idx)] st)
-        | otherwise -> Left (InvalidElement idx (length s))
-      _ -> Left (InvalidElement idx (-1))
+    objectAddress <- readInt st0 (R RDI)
+    encodedIndex <- readInt st0 (R RSI)
+    elementIndex <- unboxInteger ".elem" encodedIndex
+    object <- readMem objectAddress st0
+    value <- case object of
+      MemArray elements -> indexedValue elementIndex elements
+      MemSexp _ fields -> indexedValue elementIndex fields
+      MemClosure codeAddress captures -> indexedValue elementIndex (codeAddress : captures)
+      MemString characters -> boxInteger . ord <$> indexedValue elementIndex characters
+    writeInt st0 (R RAX) value
 
   ".sexp" -> do
-    let total = nargsOf st0
-    (vals, st) <- popN total st0
-    case vals of
-      (tag : rest) -> do
-        let (adr, st') = alloc (MemSexp tag rest) st
-        Right (pushN [adr] st')
-      [] -> Left StackUnderflow
+    argumentCount <- builtinArgumentCount st0
+    if argumentCount < 1 then Left (RuntimeFailure ".sexp: missing tag") else do
+      fields <- mapM (readBuiltinArgument st0) [0 .. argumentCount - 2]
+      tag <- readBuiltinArgument st0 (argumentCount - 1)
+      _ <- unboxInteger ".sexp tag" tag
+      returnAllocated (MemSexp tag fields) st0
 
   ".array" -> do
-    let total = nargsOf st0
-    (vals, st) <- popN total st0
-    let (adr, st') = alloc (MemArray vals) st
-    Right (pushN [adr] st')
+    argumentCount <- builtinArgumentCount st0
+    elements <- mapM (readBuiltinArgument st0) [0 .. argumentCount - 1]
+    returnAllocated (MemArray elements) st0
 
   ".closure" -> do
-    let total = nargsOf st0
-    (vals, st) <- popN total st0
-    case vals of
-      (codeOff : captured) -> do
-        let (adr, st') = alloc (MemClosure codeOff captured) st
-        Right (pushN [adr] st')
-      [] -> Left StackUnderflow
+    captureCount <- builtinArgumentCount st0
+    codeAddress <- readBuiltinArgument st0 0
+    captures <- mapM (readBuiltinArgument st0) [1 .. captureCount]
+    returnAllocated (MemClosure codeAddress captures) st0
 
   ".array_patt" -> do
-    ((n, adr), st) <- popTwo st0
-    o <- readMem adr st
-    let v = case o of
-              MemArray xs | length xs == n -> 1
-              _                            -> 0
-    Right (pushN [v] st)
+    value <- readInt st0 (R RDI)
+    encodedLength <- readInt st0 (R RSI)
+    expectedLength <- unboxInteger ".array_patt" encodedLength
+    matches <- matchObject st0 value (\object -> case object of
+      MemArray elements -> length elements == expectedLength
+      _ -> False)
+    returnBoolean matches st0
 
   ".string_patt" -> do
-    ((x, y), st) <- popTwo st0
-    ox <- readMem x st
-    oy <- readMem y st
-    let v = case (ox, oy) of
-              (MemString a, MemString b) | a == b -> 1
-              _                                  -> 0
-    Right (pushN [v] st)
+    value <- readInt st0 (R RDI)
+    patternAddress <- readInt st0 (R RSI)
+    patternObject <- readMem patternAddress st0
+    case patternObject of
+      MemString expected -> do
+        matches <- matchObject st0 value (\object -> case object of
+          MemString actual -> actual == expected
+          _ -> False)
+        returnBoolean matches st0
+      _ -> Left (RuntimeFailure ".string_patt: expected string pattern")
 
-  ".boxed_patt"       -> patt1 st0 even
-  ".unboxed_patt"     -> patt1 st0 odd
-  ".array_tag_patt"   -> patt1 st0 (isArray st0)
-  ".string_tag_patt"  -> patt1 st0 (isString st0)
-  ".sexp_tag_patt"    -> patt1 st0 (isSexp st0)
-  ".closure_tag_patt" -> patt1 st0 (isClosure st0)
+  ".boxed_patt" -> readInt st0 (R RDI) >>= \value -> returnBoolean (even value) st0
+  ".unboxed_patt" -> readInt st0 (R RDI) >>= \value -> returnBoolean (odd value) st0
+  ".array_tag_patt" -> objectPattern isArray
+  ".string_tag_patt" -> objectPattern isString
+  ".sexp_tag_patt" -> objectPattern isSexp
+  ".closure_tag_patt" -> objectPattern isClosure
 
   ".sta" -> do
-    ((z, j, x), st) <- popThree st0
-    o <- readMem x st
-    case o of
-      MemArray xs | j >= 0 && j < length xs ->
-        let xs' = take j xs ++ [z] ++ drop (j + 1) xs
-        in Right (pushN [z] st { stMem = M.insert x (MemArray xs') (stMem st) })
-      MemSexp t xs | j >= 0 && j < length xs ->
-        let xs' = take j xs ++ [z] ++ drop (j + 1) xs
-        in Right (pushN [z] st { stMem = M.insert x (MemSexp t xs') (stMem st) })
-      _ -> Right (pushN [z] st)
+    objectAddress <- readInt st0 (R RDI)
+    encodedIndex <- readInt st0 (R RSI)
+    newValue <- readInt st0 (R RDX)
+    elementIndex <- unboxInteger ".sta" encodedIndex
+    object <- readMem objectAddress st0
+    updatedObject <- case object of
+      MemArray elements -> MemArray <$> replaceElement elementIndex newValue elements
+      MemSexp tag fields -> MemSexp tag <$> replaceElement elementIndex newValue fields
+      MemString characters -> do
+        characterCode <- unboxInteger ".sta character" newValue
+        MemString <$> replaceElement elementIndex (chr (characterCode .&. 255)) characters
+      _ -> Left (RuntimeFailure ".sta: expected array, S-expression or string")
+    updatedState <- writeMem objectAddress updatedObject st0
+    writeInt updatedState (R RAX) newValue
 
   "failure" -> do
-    (msgAdr, st) <- stackPop st0
-    msg <- readMem msgAdr st >>= \case
-             MemString s -> Right s
-             _           -> Right ""
-    Left (RuntimeFailure msg)
+    messageAddress <- readInt st0 (R RDI)
+    message <- case M.lookup messageAddress (cfgStrings cfg) of
+      Just characters -> Right characters
+      Nothing -> do
+        object <- readMem messageAddress st0
+        case object of
+          MemString characters -> Right characters
+          _ -> Left (RuntimeFailure "failure: expected message string")
+    Left (RuntimeFailure message)
 
-  ".match_failure" -> do
-    (_, _st) <- popN 4 st0
-    Left MatchFailure
+  ".match_failure" -> Left MatchFailure
 
-  _ -> Left (UnknownBuiltin name)
+  _ | name `elem` noOpBuiltins -> Right st0
+    | otherwise -> Left (UnknownBuiltin name)
   where
-    patt1 :: State -> (Int -> Bool) -> Interp State
-    patt1 initialState predicate = do
-      (value, remainingState) <- stackPop initialState
-      Right (pushN [if predicate value then 1 else 0] remainingState)
+    objectPattern :: (MemObject -> Bool) -> Interp State
+    objectPattern predicate = do
+      value <- readInt st0 (R RDI)
+      matches <- matchObject st0 value predicate
+      returnBoolean matches st0
 
-    isArray   st a = case M.lookup a (stMem st) of Just (MemArray _)     -> True; _ -> False
-    isString  st a = case M.lookup a (stMem st) of Just (MemString _)    -> True; _ -> False
-    isSexp    st a = case M.lookup a (stMem st) of Just (MemSexp _ _)    -> True; _ -> False
-    isClosure st a = case M.lookup a (stMem st) of Just (MemClosure _ _) -> True; _ -> False
+    isArray :: MemObject -> Bool
+    isArray (MemArray _) = True
+    isArray _ = False
+
+    isString :: MemObject -> Bool
+    isString (MemString _) = True
+    isString _ = False
+
+    isSexp :: MemObject -> Bool
+    isSexp (MemSexp _ _) = True
+    isSexp _ = False
+
+    isClosure :: MemObject -> Bool
+    isClosure (MemClosure _ _) = True
+    isClosure _ = False
+
+readBuiltinArgument :: State -> Int -> Interp Int
+readBuiltinArgument state argumentIndex = do
+  argumentsAddress <- readInt state (R RDI)
+  let slotAddress = argumentsAddress + argumentIndex * 8
+  maybe (Left StackUnderflow) Right (M.lookup slotAddress (stkCells (stStack state)))
+
+builtinArgumentCount :: State -> Interp Int
+builtinArgumentCount state = do
+  encodedCount <- readInt state (R RSI)
+  argumentCount <- unboxInteger "builtin argument count" encodedCount
+  if argumentCount < 0 then Left (RuntimeFailure "negative builtin argument count")
+    else Right argumentCount
+
+returnAllocated :: MemObject -> State -> Interp State
+returnAllocated object state =
+  let (objectAddress, allocatedState) = alloc object state
+  in writeInt allocatedState (R RAX) objectAddress
+
+returnBoolean :: Bool -> State -> Interp State
+returnBoolean value state = writeInt state (R RAX) (boxInteger (if value then 1 else 0))
+
+matchObject :: State -> Int -> (MemObject -> Bool) -> Interp Bool
+matchObject state value predicate
+  | odd value = Right False
+  | otherwise = predicate <$> readMem value state
+
+indexedValue :: Int -> [value] -> Interp value
+indexedValue elementIndex elements
+  | elementIndex < 0 = Left (InvalidElement elementIndex (length elements))
+  | otherwise = case drop elementIndex elements of
+      value : _ -> Right value
+      [] -> Left (InvalidElement elementIndex (length elements))
+
+replaceElement :: Int -> value -> [value] -> Interp [value]
+replaceElement elementIndex newValue elements
+  | elementIndex < 0 = Left (InvalidElement elementIndex (length elements))
+  | otherwise = case splitAt elementIndex elements of
+      (prefix, _ : suffix) -> Right (prefix ++ newValue : suffix)
+      _ -> Left (InvalidElement elementIndex (length elements))
+
+renderBuiltinValue :: State -> [Int] -> Int -> Interp String
+renderBuiltinValue state visited value
+  | odd value = show <$> unboxInteger "string" value
+  | value `elem` visited = Left (RuntimeFailure "string: cyclic object")
+  | otherwise = do
+      object <- readMem value state
+      let ancestors = value : visited
+      case object of
+        MemString characters -> Right ("\"" ++ characters ++ "\"")
+        MemArray elements -> do
+          rendered <- mapM (renderBuiltinValue state ancestors) elements
+          Right ("[" ++ intercalate ", " rendered ++ "]")
+        MemClosure codeAddress captures -> do
+          rendered <- mapM (renderBuiltinValue state ancestors) captures
+          Right ("<closure " ++ intercalate ", " (("0x" ++ showHex (fromIntegral codeAddress :: Word) "") : rendered) ++ ">")
+        MemSexp encodedTag fields -> do
+          tag <- unboxInteger "string tag" encodedTag
+          let tagName = decodeTagName tag
+          if tagName == "cons" then do
+            rendered <- renderListFields state ancestors fields
+            Right ("{" ++ intercalate ", " rendered ++ "}")
+          else do
+            rendered <- mapM (renderBuiltinValue state ancestors) fields
+            Right (tagName ++ if null fields then "" else " (" ++ intercalate ", " rendered ++ ")")
+
+renderListFields :: State -> [Int] -> [Int] -> Interp [String]
+renderListFields _ _ [] = Right []
+renderListFields state visited [firstValue, remainingList] = do
+  firstText <- renderBuiltinValue state visited firstValue
+  if odd remainingList then Right [firstText]
+    else if remainingList `elem` visited then Left (RuntimeFailure "string: cyclic list")
+    else do
+      object <- readMem remainingList state
+      case object of
+        MemSexp _ fields -> (firstText :) <$> renderListFields state (remainingList : visited) fields
+        _ -> Left (RuntimeFailure "string: invalid list tail")
+renderListFields _ _ _ = Left (RuntimeFailure "string: invalid cons fields")
+
+decodeTagName :: Int -> String
+decodeTagName tag = decodeDigits (fromIntegral tag :: Word) []
+  where
+    alphabet :: String
+    alphabet = "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'"
+
+    decodeDigits :: Word -> String -> String
+    decodeDigits 0 characters = characters
+    decodeDigits remainingTag characters =
+      case drop (fromIntegral (remainingTag .&. 63)) alphabet of
+        character : _ -> decodeDigits (remainingTag `shiftR` 6) (character : characters)
+        [] -> characters
+
+indirectTargetAddress :: State -> Opnd -> Interp Int
+indirectTargetAddress state operand = do
+  operandValue <- readInt state operand
+  pure (case M.lookup operandValue (stMem state) of
+    Just (MemClosure codeAddress _) -> codeAddress
+    _ -> operandValue)
+
+builtinAtAddress :: ProgConfig -> Int -> Maybe String
+builtinAtAddress config targetAddress = do
+  labelName <- M.lookup targetAddress (cfgLabels config)
+  lookup labelName builtinSymbols
+
+jumpToAddress :: ProgConfig -> State -> Int -> Interp (State, [ExtInst])
+jumpToAddress config state targetAddress =
+  case builtinAtAddress config targetAddress of
+    Just builtinName -> do
+      returnedState <- dispatchBuiltin config builtinName state
+      (returnAddress, callerState) <- stackPop returnedState
+      continuation <- lookupOff config returnAddress
+      Right (callerState, continuation)
+    Nothing -> do
+      target <- lookupOff config targetAddress
+      Right (state, target)
 
 lookupOff :: ProgConfig -> Int -> Interp [ExtInst]
 lookupOff cfg off = case M.lookup off (cfgOffsets cfg) of
@@ -468,16 +670,16 @@ step cfg st0 ((i, _dbg) : is) = case i of
     st <- dispatchBuiltin cfg name st0
     Right (st, is)
 
-  CallI op -> do
-    v <- readInt st0 op
-    let retOff = length (cfgProgram cfg) - length is
-    case M.lookup v (stMem st0) of
-      Just (MemClosure code _) -> do
-        target <- lookupOff cfg code
-        Right (stackPush retOff st0, target)
-      _ -> do
-        target <- lookupOff cfg v
-        Right (stackPush retOff st0, target)
+  CallI operand -> do
+    targetAddress <- indirectTargetAddress st0 operand
+    case builtinAtAddress cfg targetAddress of
+      Just builtinName -> do
+        returnedState <- dispatchBuiltin cfg builtinName st0
+        Right (returnedState, is)
+      Nothing -> do
+        target <- lookupOff cfg targetAddress
+        let returnAddress = length (cfgProgram cfg) - length is
+        Right (stackPush returnAddress st0, target)
 
   Ret -> do
     (off, st') <- stackPop st0
@@ -490,19 +692,11 @@ step cfg st0 ((i, _dbg) : is) = case i of
               Right (st0, target)
       else Right (st0, is)
 
-  Jmp off -> do
-    target <- lookupOff cfg off
-    Right (st0, target)
+  Jmp targetAddress -> jumpToAddress cfg st0 targetAddress
 
-  JmpI op -> do
-    v <- readInt st0 op
-    case M.lookup v (stMem st0) of
-      Just (MemClosure code _) -> do
-        target <- lookupOff cfg code
-        Right (st0, target)
-      _ -> do
-        target <- lookupOff cfg v
-        Right (st0, target)
+  JmpI operand -> do
+    targetAddress <- indirectTargetAddress st0 operand
+    jumpToAddress cfg st0 targetAddress
 
   Dec op -> do
     v <- readInt st0 op
