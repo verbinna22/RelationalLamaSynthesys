@@ -2,8 +2,11 @@
 
 module StackMachine where
 
+-- import Debug.Trace (traceM) -- DEBUG: instruction-level tracing.
+
 import qualified Data.Map.Strict     as M
 import qualified Data.IntMap.Strict  as IM
+import Data.List (intercalate)
 
 data Patt = StrCmp | PString | PArray | PSexp | Boxed | UnBoxed | PClosure
   deriving (Show, Eq)
@@ -58,7 +61,7 @@ type Prog = [Insn]
 data Loc = Loc
   { locArgs    :: IM.IntMap Value
   , locLocals  :: IM.IntMap Value
-  , locClosure :: Maybe (IM.IntMap Value)
+  , locClosure :: Maybe Int
   } deriving Show
 
 emptyLoc :: Loc
@@ -128,6 +131,16 @@ safeIndex xs i what
   | i < 0 || i >= length xs = throwSM (what ++ ": index out of bounds: " ++ show i)
   | otherwise               = pure (xs !! i)
 
+sameValue :: Value -> Value -> Bool
+sameValue (VInt leftNumber) (VInt rightNumber) = leftNumber == rightNumber
+sameValue (VString leftId) (VString rightId) = leftId == rightId
+sameValue (VArray leftId) (VArray rightId) = leftId == rightId
+sameValue (VSexp _ leftId) (VSexp _ rightId) = leftId == rightId
+sameValue (VClosure _ leftId) (VClosure _ rightId) = leftId == rightId
+sameValue (VBuiltin leftName) (VBuiltin rightName) = leftName == rightName
+sameValue VEmpty VEmpty = True
+sameValue _ _ = False
+
 binopFunc :: String -> Integer -> Integer -> SM Integer
 binopFunc "+"  a b = pure (a + b)
 binopFunc "-"  a b = pure (a - b)
@@ -148,26 +161,29 @@ binopFunc "&&" a b = pure (b2i (a /= 0 && b /= 0))
 binopFunc "!!" a b = pure (b2i (a /= 0 || b /= 0))
 binopFunc op _ _   = throwSM ("unknown binary operator: " ++ op)
 
-lookupDesignation :: M.Map String Value -> Loc -> Designation -> SM Value
-lookupDesignation g _ (DGlobal s) = case M.lookup s g of
-  Just v  -> pure v
-  Nothing -> throwSM ("unbound global: " ++ s)
-lookupDesignation _ l (DLocal  i) = case IM.lookup i (locLocals l) of
-  Just v  -> pure v
-  Nothing -> throwSM ("unbound local: " ++ show i)
-lookupDesignation _ l (DArg    i) = case IM.lookup i (locArgs l) of
-  Just v  -> pure v
-  Nothing -> throwSM ("unbound argument: " ++ show i)
-lookupDesignation _ l (DAccess i) = case (locClosure l >>= IM.lookup i) of
-  Just v  -> pure v
-  Nothing -> throwSM ("unbound closure slot: " ++ show i)
+lookupDesignation :: Config -> Designation -> SM Value
+lookupDesignation state designation = case designation of
+  DGlobal name -> maybe (throwSM ("unbound global: " ++ name)) pure (M.lookup name (glob state))
+  DLocal index -> maybe (throwSM ("unbound local: " ++ show index)) pure (IM.lookup index (locLocals (loc state)))
+  DArg index -> maybe (throwSM ("unbound argument: " ++ show index)) pure (IM.lookup index (locArgs (loc state)))
+  DAccess index -> do
+    objectId <- currentClosureId state
+    capturedValues <- lookupStore objectId state
+    safeIndex capturedValues index "closure access"
 
-updateDesignation :: M.Map String Value -> Loc -> Value -> Designation
-                  -> (M.Map String Value, Loc)
-updateDesignation g l v (DGlobal s) = (M.insert s v g, l)
-updateDesignation g l v (DLocal  i) = (g, l { locLocals  = IM.insert i v (locLocals  l) })
-updateDesignation g l v (DArg    i) = (g, l { locArgs    = IM.insert i v (locArgs    l) })
-updateDesignation g l v (DAccess i) = (g, l { locClosure = fmap (IM.insert i v) (locClosure l) })
+currentClosureId :: Config -> SM Int
+currentClosureId state = maybe (throwSM "no active closure") pure (locClosure (loc state))
+
+updateDesignation :: Config -> Value -> Designation -> SM Config
+updateDesignation state value designation = case designation of
+  DGlobal name -> pure state { glob = M.insert name value (glob state) }
+  DLocal index -> pure state { loc = (loc state) { locLocals = IM.insert index value (locLocals (loc state)) } }
+  DArg index -> pure state { loc = (loc state) { locArgs = IM.insert index value (locArgs (loc state)) } }
+  DAccess index -> do
+    objectId <- currentClosureId state
+    capturedValues <- lookupStore objectId state
+    updatedValues <- replaceAtSM index value capturedValues
+    updateStore objectId updatedValues state
 
 allocStore :: [Value] -> Config -> (Int, Config)
 allocStore vs c =
@@ -197,12 +213,13 @@ showValue s (VString i) = case IM.lookup i s of
   Just vs -> "\"" ++ concatMap renderChar vs ++ "\""
   where renderChar (VInt c) = [toEnum (fromIntegral c)]
         renderChar _        = "?"
-showValue s (VArray i)  = case IM.lookup i s of
+showValue valueStore (VArray objectId) = case IM.lookup objectId valueStore of
   Nothing -> "<array#?>"
-  Just vs -> "[" ++ unwords (map (showValue s) vs) ++ "]"
-showValue s (VSexp t i) = case IM.lookup i s of
-  Nothing -> "<" ++ t ++ "#?>"
-  Just vs -> "(" ++ unwords (t : map (showValue s) vs) ++ ")"
+  Just elements -> "[" ++ intercalate ", " (map (showValue valueStore) elements) ++ "]"
+showValue valueStore (VSexp tag objectId) = case IM.lookup objectId valueStore of
+  Nothing -> "<" ++ tag ++ "#?>"
+  Just [] -> tag
+  Just fields -> tag ++ " (" ++ intercalate ", " (map (showValue valueStore) fields) ++ ")"
 showValue s (VClosure n _) = "<closure " ++ n ++ ">"
 showValue _ (VBuiltin n)   = "<builtin " ++ n ++ ">"
 showValue s VEmpty         = "<empty>"
@@ -212,7 +229,7 @@ builtin "read" _ c = case inp c of
   (x:xs) -> pure c { inp = xs, stk = VInt (fromIntegral x) : stk c }
   []     -> throwSM "read: no input available"
 
-builtin "write" [VInt n] c = pure c { out = out c ++ [fromIntegral n] }
+builtin "write" [VInt n] c = pure c { out = out c ++ [fromIntegral n], stk = VEmpty : stk c }
 builtin "write" args _     = throwSM ("write: bad args " ++ show args)
 
 builtin "length" [VString i] c = do
@@ -259,10 +276,8 @@ step env conf (insn : rest) = case insn of
     pure (conf' { stk = VSexp tag i : rest' }, rest)
 
   BINOP "==" -> case stk conf of
-    (y : x : rest') -> case (x, y) of
-      (VInt a, VInt b) -> pure (conf { stk = VInt (b2i (a == b)) : rest' }, rest)
-      _ -> throwSM ("BINOP ==: unexpected operands: "
-                    ++ show x ++ " vs. " ++ show y)
+    (rightValue : leftValue : remainingStack) ->
+      pure (conf { stk = VInt (b2i (sameValue leftValue rightValue)) : remainingStack }, rest)
     _ -> throwSM "BINOP ==: stack underflow"
 
   BINOP op -> case stk conf of
@@ -274,19 +289,28 @@ step env conf (insn : rest) = case insn of
     _ -> throwSM ("BINOP " ++ op ++ ": stack underflow")
 
   ELEM -> case stk conf of
-    (a : b : rest') -> do
-      c <- builtin ".elem" [b, a] (conf { stk = rest' })
-      pure (c, rest)
+    (indexValue : container : remainingStack) -> do
+      elementIndex <- toInt indexValue
+      elements <- case container of
+        VArray objectId -> lookupStore objectId conf
+        VString objectId -> lookupStore objectId conf
+        VSexp _ objectId -> lookupStore objectId conf
+        _ -> throwSM ("ELEM: not a container: " ++ show container)
+      if elementIndex < 0 || elementIndex > toInteger (maxBound :: Int)
+        then throwSM ("ELEM: index out of bounds: " ++ show elementIndex)
+        else do
+          element <- safeIndex elements (fromInteger elementIndex) "ELEM"
+          pure (conf { stk = element : remainingStack }, rest)
     _ -> throwSM "ELEM: stack underflow"
 
   LD x -> do
-    v <- lookupDesignation (glob conf) (loc conf) x
+    v <- lookupDesignation conf x
     pure (conf { stk = v : stk conf }, rest)
 
   ST x -> case stk conf of
     (z : rest') -> do
-      let (g', l') = updateDesignation (glob conf) (loc conf) z x
-      pure (conf { stk = z : rest', glob = g', loc = l' }, rest)
+      updatedState <- updateDesignation conf z x
+      pure (updatedState, rest)
     _ -> throwSM "ST: stack underflow"
 
   STA -> case stk conf of
@@ -331,7 +355,7 @@ step env conf (insn : rest) = case insn of
     _ -> throwSM "CJMP: stack underflow"
 
   CLOSURE name dgs -> do
-    cl <- mapM (capture (loc conf)) dgs
+    cl <- mapM (capture conf) dgs
     let (ident, conf') = allocStore cl conf
     pure (conf' { stk = VClosure name ident : stk conf }, rest)
 
@@ -354,11 +378,11 @@ step env conf (insn : rest) = case insn of
     (vs, rest') <- splitStack (n + 1) (stk conf)
     case reverse vs of
       (VClosure name ident : args) -> do
-        cl <- lookupStore ident conf
+        _ <- lookupStore ident conf
         let argsMap = IM.fromList (zip [0..] args)
         let newLoc = Loc { locArgs    = argsMap
                          , locLocals  = IM.empty
-                         , locClosure = Just (IM.fromList (zip [0..] cl)) }
+                         , locClosure = Just ident }
         p <- jumpTo env name
         pure (conf { cstack = (rest, loc conf, rest') : cstack conf
                    , stk    = rest'
@@ -465,16 +489,15 @@ jumpTo env l = case M.lookup l env of
   Just p  -> pure p
   Nothing -> throwSM ("undefined label: " ++ l)
 
-capture :: Loc -> Designation -> SM Value
-capture l = \case
-  DArg    i -> maybe (throwSM ("CLOSURE: bad arg "    ++ show i)) pure (IM.lookup i (locArgs    l))
-  DLocal  i -> maybe (throwSM ("CLOSURE: bad local "  ++ show i)) pure (IM.lookup i (locLocals  l))
-  DAccess i -> maybe (throwSM ("CLOSURE: bad access " ++ show i)) pure ((locClosure l >>= IM.lookup i))
-  _         -> throwSM "CLOSURE: bad designation"
+capture :: Config -> Designation -> SM Value
+capture state designation = case designation of
+  DGlobal _ -> throwSM "CLOSURE: bad designation"
+  _ -> lookupDesignation state designation
 
 eval :: LabelEnv -> Config -> Prog -> SM Config
 eval env conf [] = pure conf
 eval env conf prog = do
+  -- traceM ("SM TRACE next=" ++ show (take 1 prog) ++ " stack=" ++ show (stk conf) ++ " globals=" ++ show (glob conf) ++ " output=" ++ show (out conf) ++ " locals=" ++ show (loc conf) ++ " heap=" ++ show (store conf)) -- DEBUG
   (conf', prog') <- step env conf prog
   eval env conf' prog'
 

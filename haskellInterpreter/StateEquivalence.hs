@@ -190,15 +190,27 @@ checkClosure :: M.Map Int String -> SM.Config -> X.State -> MemoryAddressMapping
 checkClosure entryAddressToFunctionName smState x86State addressMapping =
   case SM.locClosure (SM.loc smState) of
     Nothing -> Just addressMapping
-    Just capturedValues
-      | IM.null capturedValues -> Just addressMapping
-      | otherwise ->
-          case M.lookup (X.stRegs x86State ! X.R15) (X.stMem x86State) of
-            Just (X.MemClosure _ x86CapturedValues) -> do
-              guard (IM.size capturedValues == length x86CapturedValues)
-              equalValues entryAddressToFunctionName smState x86State
-                (zip (IM.elems capturedValues) x86CapturedValues) addressMapping
-            _ -> Nothing
+    Just closureId -> do
+      capturedValues <- IM.lookup closureId (SM.store smState)
+      if null capturedValues then Just addressMapping else do
+        x86ClosureAddress <- M.lookup X.R15 (X.stRegs x86State)
+        case M.lookup x86ClosureAddress (X.stMem x86State) of
+          Just (X.MemClosure _ x86CapturedValues) -> do
+            guard (length capturedValues == length x86CapturedValues)
+            mappingAfterClosure <- case
+              (M.lookup closureId (smToX86Addresses addressMapping),
+               M.lookup x86ClosureAddress (x86ToSMAddresses addressMapping)) of
+              (Nothing, Nothing) -> Just addressMapping
+                { smToX86Addresses = M.insert closureId x86ClosureAddress (smToX86Addresses addressMapping)
+                , x86ToSMAddresses = M.insert x86ClosureAddress closureId (x86ToSMAddresses addressMapping)
+                }
+              (Just mappedX86, Just mappedSM) -> do
+                guard (mappedX86 == x86ClosureAddress && mappedSM == closureId)
+                Just addressMapping
+              _ -> Nothing
+            equalValues entryAddressToFunctionName smState x86State
+              (zip capturedValues x86CapturedValues) mappingAfterClosure
+          _ -> Nothing
 
 checkStack :: M.Map Int String -> SM.Config -> X.State -> MemoryAddressMapping -> Maybe MemoryAddressMapping
 checkStack entryAddressToFunctionName smState x86State addressMapping =
@@ -301,7 +313,7 @@ savedCallerRegisters smState = case SM.cstack smState of
         callerArgumentCount = if null olderFrames then 2 else IM.size (SM.locArgs callerLocals)
 
         closureRegisters :: [X.Register]
-        closureRegisters = if maybe True IM.null (SM.locClosure callerLocals) then [] else [X.R15]
+        closureRegisters = if maybe True (null . (SM.store smState IM.!)) (SM.locClosure callerLocals) then [] else [X.R15]
     in closureRegisters
       ++ take callerArgumentCount argumentRegisters
       ++ take savedOperandCount operandRegisters

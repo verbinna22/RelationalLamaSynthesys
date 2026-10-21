@@ -2,14 +2,15 @@
 
 module X86Interp where
 
+-- import Debug.Trace (traceM) -- DEBUG: instruction-level tracing.
+
 import qualified Data.Map.Strict as M
 import Data.Map.Strict (Map)
 import Data.Char (chr, ord)
-import Data.List (intercalate)
+import Data.List (intercalate, foldl')
 import Numeric (showHex)
 import Data.Bits ((.&.), (.|.), xor, shiftL, shiftR, complement)
 import Data.Word (Word)
-import Control.Monad (foldM)
 
 data Register
   = RAX | RDI | RSI | RDX | RCX | RBP | RSP
@@ -23,7 +24,8 @@ data Opnd
   = R Register
   | S Int
   | L Int
-  | I Int
+  | IR15 Int
+  | IRIP Int
   deriving (Eq, Show)
 
 data Instr
@@ -199,7 +201,8 @@ readInt st op = case op of
   R r   -> Right (M.findWithDefault 0 r (stRegs st))
   S i   -> maybe (Left (InvalidStackIndex i)) Right (stackRead i st)
   L i   -> Right i
-  I off -> do
+  IRIP address -> maybe (Left (InvalidMemoryAddress address)) Right (M.lookup address (stGlob st))
+  IR15 off -> do
     let adr = M.findWithDefault 0 R15 (stRegs st)
     o <- readMem adr st
     case o of
@@ -215,7 +218,8 @@ writeInt st op v = case op of
   R r   -> Right st { stRegs = M.insert r v (stRegs st) }
   S i   -> Right (stackWrite i v st)
   L _   -> Left WriteToLiteral
-  I offset -> writeClosureCapture st offset v
+  IRIP address -> Right st { stGlob = M.insert address v (stGlob st) }
+  IR15 offset -> writeClosureCapture st offset v
 
 writeClosureCapture :: State -> Int -> Int -> Interp State
 writeClosureCapture state byteOffset newValue
@@ -238,7 +242,8 @@ readAddr st op = case op of
   S i   -> Right (rbpOf st - (i + 1) * 8)
   L i   -> Right i
   R _   -> Left (WriteToRegister "cannot take address of register")
-  I _   -> Left (InvalidMemoryAddress (-1))
+  IRIP address -> Right address
+  IR15 _ -> Left (InvalidMemoryAddress (-1))
 
 flagsFromSub :: Int -> Int -> Flags
 flagsFromSub a b =
@@ -620,11 +625,11 @@ step cfg st0 ((i, _dbg) : is) = case i of
     vb <- readInt st0 b
     case op of
       "+"    -> writeInt st0 b (va + vb)     >>= \s -> Right (s, is)
-      "-"    -> writeInt st0 b (va - vb)     >>= \s -> Right (s, is)
+      "-"    -> writeInt st0 b (vb - va)     >>= \s -> Right (s, is)
       "*"    -> writeInt st0 b (va * vb)     >>= \s -> Right (s, is)
-      "&&"   -> writeInt st0 b (va .&. vb)   >>= \s -> Right (s, is)
-      "!!"   -> writeInt st0 b (va .|. vb)   >>= \s -> Right (s, is)
-      "^"    -> writeInt st0 b (va `xor` vb) >>= \s -> Right (s, is)
+      "&&"   -> writeInt (st0 { stFlags = flagsFromLogic (va .&. vb) }) b (va .&. vb)   >>= \s -> Right (s, is)
+      "!!"   -> writeInt (st0 { stFlags = flagsFromLogic (va .|. vb) }) b (va .|. vb)   >>= \s -> Right (s, is)
+      "^"    -> writeInt (st0 { stFlags = flagsFromLogic (va `xor` vb) }) b (va `xor` vb) >>= \s -> Right (s, is)
       "cmp"  -> Right (st0 { stFlags = flagsFromSub vb va }, is)
       "test" -> Right (st0 { stFlags = flagsFromLogic (va .&. vb) }, is)
       _      -> Left (UnknownBuiltin ("binop " ++ op))
@@ -704,7 +709,7 @@ step cfg st0 ((i, _dbg) : is) = case i of
 
   Or1 op -> do
     v <- readInt st0 op
-    writeInt st0 op (v .|. 1) >>= \s -> Right (s, is)
+    writeInt (st0 { stFlags = flagsFromLogic (v .|. 1) }) op (v .|. 1) >>= \s -> Right (s, is)
 
   Sal1 op -> do
     v <- readInt st0 op
@@ -715,20 +720,33 @@ step cfg st0 ((i, _dbg) : is) = case i of
     writeInt st0 op (v `shiftR` 1) >>= \s -> Right (s, is)
 
   Repmovsl -> do
-    let rcxV = M.findWithDefault 0 RCX (stRegs st0)
-        rsiV = M.findWithDefault 0 RSI (stRegs st0)
-        rdiV = M.findWithDefault 0 RDI (stRegs st0)
-    st <- foldM (\s k -> do
-                    let sA = rsiV + k * 8
-                        dA = rdiV + k * 8
-                    o <- readMem sA s
-                    writeMem dA o s)
-                st0 [0 .. rcxV - 1]
-    Right (st, is)
+    filledState <- fillStackFromFiller cfg st0
+    Right (filledState, is)
+
 step _ _ [] = Left (InvalidMemoryAddress (-1))
+
+fillStackFromFiller :: ProgConfig -> State -> Interp State
+fillStackFromFiller config state = do
+  wordCount <- readInt state (R RCX)
+  sourceAddress <- readInt state (R RSI)
+  destinationAddress <- readInt state (R RDI)
+  if wordCount < 0 then Left (RuntimeFailure "Repmovsl: negative word count")
+    else if wordCount == 0 then Right state
+    else if M.lookup sourceAddress (cfgLabels config) /= Just "filler"
+      then Left (RuntimeFailure "Repmovsl: expected filler source")
+    else do
+      fillerValue <- readInt state (IRIP sourceAddress)
+      let filledCells = foldl' (\cells wordIndex ->
+            M.insert (destinationAddress + wordIndex * 8) fillerValue cells)
+            (stkCells (stStack state)) [0 .. wordCount - 1]
+          updatedRegisters = M.insert RCX 0
+            (M.insert RSI (sourceAddress + wordCount * 8)
+              (M.insert RDI (destinationAddress + wordCount * 8) (stRegs state)))
+      Right state { stStack = Stack filledCells, stRegs = updatedRegisters }
 
 runInterp :: ProgConfig -> Machine -> Interp State
 runInterp _   (Machine [] st) = Right st
 runInterp cfg (Machine rest st) = do
+  -- traceM ("X86 TRACE next=" ++ show (take 1 rest) ++ " regs=" ++ show (stRegs st) ++ " stack=" ++ show (stStack st) ++ " globals=" ++ show (stGlob st) ++ " flags=" ++ show (stFlags st) ++ " heap=" ++ show (stMem st) ++ " output=" ++ show (stOutput st)) -- DEBUG
   (st', rest') <- step cfg st rest
   runInterp cfg (Machine rest' st')

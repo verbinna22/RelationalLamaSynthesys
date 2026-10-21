@@ -8,13 +8,14 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
 import qualified X86Interp as X
 
-type ParsedAssembly = ([X.ExtInst], Map Int String, Map Int String)
+type ParsedAssembly = ([X.ExtInst], Map Int String, Map Int String, Map Int Int)
 
 data AssemblyLabels = AssemblyLabels
   { labelAddresses :: Map String Int
   , labelNames :: Map Int String
   , assemblyConstants :: Map String Int
   , stringConstants :: Map Int String
+  , globalInitialValues :: Map Int Int
   , nextDataAddress :: Int
   , nextInstructionOffset :: Int
   , parsedInstructions :: [(ParsedInstruction, Maybe String)]
@@ -26,7 +27,7 @@ parseAssembly sourceText = do
   let sourceLines = zip [1 ..] (lines sourceText)
   labels <- collectLabels sourceLines
   instructions <- decodeInstructions labels
-  pure (instructions, labelNames labels, stringConstants labels)
+  pure (instructions, labelNames labels, stringConstants labels, globalInitialValues labels)
 
 collectLabels :: [(Int, String)] -> Either String AssemblyLabels
 collectLabels sourceLines = do
@@ -51,6 +52,7 @@ initialState = AssemblyLabels
   , labelNames = M.singleton (-2) "filler"
   , assemblyConstants = M.empty
   , stringConstants = M.empty
+  , globalInitialValues = M.singleton (-2) 1
   , nextDataAddress = -4
   , nextInstructionOffset = 0
   , parsedInstructions = []
@@ -67,7 +69,16 @@ collectLineLabels labels (lineNumber, sourceLine) =
           updatedLabels <- registerCodeLabel labelName
           pure updatedLabels { lastComment = Just (dropWhile isSpace commentText) }
         contents -> case break isSpace contents of
-          (".quad", _) -> registerDataLabel labels labelName Nothing
+          (".quad", valueText) -> do
+            initialValue <- maybe
+              (Left ("Line " ++ show lineNumber ++ ": expected .quad integer")) Right
+              (readMachineInt (trim (takeWhile (/= '#') valueText)))
+            updatedLabels <- registerDataLabel labels labelName Nothing
+            globalAddress <- maybe (Left ("Missing global label: " ++ labelName)) Right
+              (M.lookup labelName (labelAddresses updatedLabels))
+            pure updatedLabels
+              { globalInitialValues = M.insert globalAddress initialValue (globalInitialValues updatedLabels) }
+
           (".string", literalText) -> do
             stringValue <- parseStringLiteral (lineNumber, dropWhile isSpace literalText)
             registerDataLabel labels labelName (Just stringValue)
@@ -215,7 +226,7 @@ parseInstruction (lineNumber, instructionText) =
       | Just labelName <- stripSuffix "(%rip)" sourceText = Right $ do
           resolveAddress <- parseAddress lineNumber labelName
           resolveDestination <- parseOperand lineNumber destinationText
-          pure (\labels -> X.Lea . X.L <$> resolveAddress labels <*> resolveDestination labels)
+          pure (\labels -> X.Lea . X.IRIP <$> resolveAddress labels <*> resolveDestination labels)
       | Just _ <- stackOperand sourceText = binary X.Lea True [sourceText, destinationText]
       | otherwise = Right Nothing
     addressInstruction _ = invalidOperands
@@ -274,11 +285,11 @@ parseOperand lineNumber operandText
   | Just numberOrLabel <- stripPrefix "$" operandText =
       fmap (\resolveAddress labels -> X.L <$> resolveAddress labels) (parseAddress lineNumber numberOrLabel)
   | Just labelName <- stripSuffix "(%rip)" operandText =
-      fmap (\resolveAddress labels -> X.L <$> resolveAddress labels) (parseAddress lineNumber labelName)
+      fmap (\resolveAddress labels -> X.IRIP <$> resolveAddress labels) (parseAddress lineNumber labelName)
   | Just operand <- stackOperand operandText = Just (const (Right operand))
   | Just displacementText <- stripSuffix "(%r15)" operandText
   , Just displacement <- readMachineInt displacementText
-  , displacement >= 8 && displacement `mod` 8 == 0 = Just (const (Right (X.I displacement)))
+  , displacement >= 8 && displacement `mod` 8 == 0 = Just (const (Right (X.IR15 displacement)))
   | otherwise = Nothing
   where
     registers :: [(String, X.Register)]
