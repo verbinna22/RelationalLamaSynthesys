@@ -18,8 +18,8 @@ data AssemblyLabels = AssemblyLabels
   , globalInitialValues :: Map Int Int
   , nextDataAddress :: Int
   , nextInstructionOffset :: Int
-  , parsedInstructions :: [(ParsedInstruction, Maybe String)]
-  , lastComment :: Maybe String
+  , parsedInstructions :: [(ParsedInstruction, Maybe (Int, String))]
+  , lastComment :: Maybe (Int, String)
   }
 
 parseAssembly :: String -> Either String ParsedAssembly
@@ -67,7 +67,7 @@ collectLineLabels labels (lineNumber, sourceLine) =
         "" -> registerCodeLabel labelName
         '#' : commentText -> do
           updatedLabels <- registerCodeLabel labelName
-          pure updatedLabels { lastComment = Just (dropWhile isSpace commentText) }
+          pure updatedLabels { lastComment = Just (lineNumber, dropWhile isSpace commentText) }
         contents -> case break isSpace contents of
           (".quad", valueText) -> do
             initialValue <- maybe
@@ -121,14 +121,14 @@ countInstruction :: AssemblyLabels -> (Int, String) -> Either String AssemblyLab
 countInstruction labels (lineNumber, sourceLine) =
   case dropWhile isSpace sourceLine of
     "" -> Right labels
-    '#' : commentText -> Right labels { lastComment = Just (dropWhile isSpace commentText) }
+    '#' : commentText -> Right labels { lastComment = Just (lineNumber, dropWhile isSpace commentText) }
     directiveText@('.' : _) ->
       case break isSpace (takeWhile (/= '#') directiveText) of
         (".set", argumentsText) -> collectSetConstant labels (lineNumber, argumentsText)
         _ -> Right labels
     instructionText -> do
       let updatedLabels = case break (== '#') instructionText of
-            (_, '#' : commentText) -> labels { lastComment = Just (dropWhile isSpace commentText) }
+            (_, '#' : commentText) -> labels { lastComment = Just (lineNumber, dropWhile isSpace commentText) }
             _ -> labels
       parsedInstruction <- parseInstruction (lineNumber, instructionText)
       case parsedInstruction of
@@ -399,7 +399,7 @@ parseStringLiteral (lineNumber, literalText) =
 decodeInstructions :: AssemblyLabels -> Either String [X.ExtInst]
 decodeInstructions labels = mapM resolveInstruction (reverse (parsedInstructions labels))
   where
-    resolveInstruction :: (ParsedInstruction, Maybe String) -> Either String X.ExtInst
+    resolveInstruction :: (ParsedInstruction, Maybe (Int, String)) -> Either String X.ExtInst
     resolveInstruction (parsedInstruction, instructionComment) = do
       instruction <- parsedInstruction labels
       pure (instruction, instructionComment)

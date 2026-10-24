@@ -5,8 +5,6 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.Int (Int32)
 import qualified Data.IntMap.Strict as IM
-import qualified Data.Map.Strict as M
-import qualified Data.Set as Set
 import Data.Word (Word8, Word32)
 import qualified StackMachine as SM
 
@@ -113,60 +111,72 @@ findMain (publicSymbol : remainingSymbols)
 
 decodeProgram :: BytecodeFile -> [PublicSymbol] -> Int -> Either ParseError SM.Prog
 decodeProgram bytecodeFile publicSymbols mainOffset = do
-  decodedInstructions <- decodeInstructions bytecodeFile codeLabel
-  let instructionsByOffset = IM.fromDistinctAscList decodedInstructions
-      labeledInstructions = [(codeLabel codeOffset, instruction) | (codeOffset, instruction) <- decodedInstructions]
-      instructionLabels = Set.fromList (map fst labeledInstructions)
+  decodedInstructions <- decodeInstructions bytecodeFile
+  let addressesByOffset = IM.fromDistinctAscList
+        (zip (map fst decodedInstructions) [0..])
+      instructionsByOffset = IM.fromDistinctAscList decodedInstructions
   case IM.lookup mainOffset instructionsByOffset of
-    Just (SM.BEGIN _ _ _) -> pure ()
+    Just (SM.BEGIN _ _) -> pure ()
     _ -> Left (InvalidBytecode "main does not point to BEGIN/CBEGIN")
-  mapM_ (validatePublicSymbol instructionsByOffset) publicSymbols
-  mapM_ (validateTargets instructionLabels . snd) decodedInstructions
-  pure (SM.JMP (codeLabel mainOffset) : foldr addLabel [] labeledInstructions)
+  entryAddress <- resolveAddress addressesByOffset mainOffset
+  namedAddresses <- traverse (resolvePublicSymbol addressesByOffset) publicSymbols
+  instructions <- traverse (resolveInstruction addressesByOffset . snd) decodedInstructions
+  pure SM.Prog
+    { SM.programInstructions = markTailCalls (IM.fromDistinctAscList (zip [0..] instructions))
+    , SM.programEntry = entryAddress
+    , SM.programFunctionNames = IM.fromList namedAddresses
+    }
   where
-    publicNames :: IM.IntMap String
-    publicNames = IM.fromList [(publicCodeOffset symbol, publicSymbolName symbol) | symbol <- publicSymbols]
+    resolveAddress :: IM.IntMap Int -> Int -> Either ParseError Int
+    resolveAddress addressesByOffset byteOffset = case IM.lookup byteOffset addressesByOffset of
+      Just instructionIndex -> Right instructionIndex
+      Nothing -> Left (InvalidBytecode ("Target is not at an instruction boundary: " ++ show byteOffset))
 
-    labelPrefix :: String
-    labelPrefix = replicate (1 + maximum (0 : map (length . publicSymbolName) publicSymbols)) '$'
+    resolvePublicSymbol :: IM.IntMap Int -> PublicSymbol -> Either ParseError (Int, String)
+    resolvePublicSymbol addressesByOffset symbol = do
+      instructionIndex <- resolveAddress addressesByOffset (publicCodeOffset symbol)
+      pure (instructionIndex, publicSymbolName symbol)
 
-    publicNameCounts :: M.Map String Int
-    publicNameCounts = M.fromListWith (+) [(name, 1) | name <- IM.elems publicNames]
+    resolveInstruction :: IM.IntMap Int -> SM.Insn -> Either ParseError SM.Insn
+    resolveInstruction addressesByOffset instruction = case instruction of
+      SM.JMP target -> SM.JMP <$> resolveAddress addressesByOffset target
+      SM.CJMP condition target -> SM.CJMP condition <$> resolveAddress addressesByOffset target
+      SM.CLOSURE target captures -> do
+        instructionIndex <- resolveAddress addressesByOffset target
+        pure (SM.CLOSURE instructionIndex captures)
+      SM.CALL target argumentCount -> do
+        instructionIndex <- resolveAddress addressesByOffset target
+        pure (SM.CALL instructionIndex argumentCount)
+      _ -> Right instruction
 
-    uniquePublicNames :: IM.IntMap String
-    uniquePublicNames = IM.filter usablePublicName publicNames
+markTailCalls :: IM.IntMap SM.Insn -> IM.IntMap SM.Insn
+markTailCalls instructions = snd (IM.mapAccumWithKey markInstruction 0 instructions)
+  where
+    markInstruction :: Int -> Int -> SM.Insn -> (Int, SM.Insn)
+    markInstruction argumentCount instructionAddress instruction = case instruction of
+      SM.BEGIN nargs _ -> (nargs, instruction)
+      SM.CALL target nargs
+        | nargs == argumentCount && returnsImmediately (instructionAddress + 1) ->
+            (argumentCount, SM.CALL_TAIL target nargs)
+      SM.CALLC nargs
+        | nargs == argumentCount && returnsImmediately (instructionAddress + 1) ->
+            (argumentCount, SM.CALLC_TAIL nargs)
+      SM.BUILTIN name nargs
+        | name `elem` ["read", "write", "length"]
+        , nargs == argumentCount && returnsImmediately (instructionAddress + 1) ->
+            (argumentCount, SM.BUILTIN_TAIL name nargs)
+      _ -> (argumentCount, instruction)
 
-    usablePublicName :: String -> Bool
-    usablePublicName publicName =
-      not (isBuiltinName publicName) && M.lookup publicName publicNameCounts == Just 1
+    returnsImmediately :: Int -> Bool
+    returnsImmediately instructionAddress = case IM.lookup instructionAddress instructions of
+      Just (SM.LINE _) -> returnsImmediately (instructionAddress + 1)
+      Just (SM.JMP target) -> returnsImmediately target
+      Just SM.END -> True
+      Just SM.RET -> True
+      _ -> False
 
-    codeLabel :: Int -> String
-    codeLabel codeOffset = IM.findWithDefault (labelPrefix ++ show codeOffset) codeOffset uniquePublicNames
-
-    validatePublicSymbol :: IM.IntMap SM.Insn -> PublicSymbol -> Either ParseError ()
-    validatePublicSymbol instructionsByOffset symbol
-      | IM.member (publicCodeOffset symbol) instructionsByOffset = Right ()
-      | otherwise = Left (InvalidBytecode ("Public symbol is not at an instruction boundary: " ++ publicSymbolName symbol))
-
-    validateTargets :: Set.Set String -> SM.Insn -> Either ParseError ()
-    validateTargets instructionLabels instruction = case instruction of
-      SM.JMP target -> validateTarget target
-      SM.CJMP _ target -> validateTarget target
-      SM.CLOSURE target _ -> validateTarget target
-      SM.CALL target _ | not (isBuiltinName target) -> validateTarget target
-      _ -> Right ()
-      where
-        validateTarget :: String -> Either ParseError ()
-        validateTarget target
-          | Set.member target instructionLabels = Right ()
-          | otherwise = Left (InvalidBytecode ("Target is not at an instruction boundary: " ++ target))
-
-    addLabel :: (String, SM.Insn) -> SM.Prog -> SM.Prog
-    addLabel (labelName, instruction) remainingProgram =
-      SM.LABEL labelName : instruction : remainingProgram
-
-decodeInstructions :: BytecodeFile -> (Int -> String) -> Either ParseError [(Int, SM.Insn)]
-decodeInstructions bytecodeFile codeLabel = decodeRemaining 0 (instructionBytes bytecodeFile) []
+decodeInstructions :: BytecodeFile -> Either ParseError [(Int, SM.Insn)]
+decodeInstructions bytecodeFile = decodeRemaining 0 (instructionBytes bytecodeFile) []
   where
     decodeRemaining :: Int -> BS.ByteString -> [(Int, SM.Insn)] -> Either ParseError [(Int, SM.Insn)]
     decodeRemaining codeOffset remainingBytes decodedInstructions =
@@ -176,14 +186,14 @@ decodeInstructions bytecodeFile codeLabel = decodeRemaining 0 (instructionBytes 
           | BS.null trailingBytes -> Right (reverse decodedInstructions)
           | otherwise -> Left (InvalidBytecode "Bytes after bytecode terminator")
         Just (opcode, operandBytes) -> do
-          (instruction, afterInstruction) <- decodeInstruction bytecodeFile codeLabel codeOffset opcode operandBytes
+          (instruction, afterInstruction) <- decodeInstruction bytecodeFile codeOffset opcode operandBytes
           let instructionSize = BS.length remainingBytes - BS.length afterInstruction
           decodeRemaining (codeOffset + instructionSize) afterInstruction
             ((codeOffset, instruction) : decodedInstructions)
 
-decodeInstruction :: BytecodeFile -> (Int -> String) -> Int -> Word8 -> BS.ByteString
+decodeInstruction :: BytecodeFile -> Int -> Word8 -> BS.ByteString
   -> Either ParseError (SM.Insn, BS.ByteString)
-decodeInstruction bytecodeFile codeLabel codeOffset opcode operandBytes
+decodeInstruction bytecodeFile codeOffset opcode operandBytes
   | opcode >= 0x20 && opcode <= 0x23 = designationInstruction SM.LD (opcode - 0x20)
   | opcode >= 0x40 && opcode <= 0x43 = designationInstruction SM.ST (opcode - 0x40)
   | opcode >= 0x30 && opcode <= 0x33 = Left (InvalidBytecode "LDA is not supported by StackMachine")
@@ -209,20 +219,20 @@ decodeInstruction bytecodeFile codeLabel codeOffset opcode operandBytes
       0x12 -> namedFields SM.SEXP
       0x13 -> Left (InvalidBytecode "STI is not supported by StackMachine")
       0x14 -> noOperands SM.STA
-      0x15 -> oneWord (SM.JMP . codeLabel . fromIntegral)
+      0x15 -> oneWord (SM.JMP . fromIntegral)
       0x16 -> noOperands SM.END
       0x17 -> noOperands SM.RET
       0x18 -> noOperands SM.DROP
       0x19 -> noOperands SM.DUP
       0x1a -> noOperands SM.SWAP
       0x1b -> noOperands SM.ELEM
-      0x50 -> oneWord (SM.CJMP "z" . codeLabel . fromIntegral)
-      0x51 -> oneWord (SM.CJMP "nz" . codeLabel . fromIntegral)
-      0x52 -> twoWords (SM.BEGIN (codeLabel codeOffset))
-      0x53 -> twoWords (SM.BEGIN (codeLabel codeOffset))
+      0x50 -> oneWord (SM.CJMP "z" . fromIntegral)
+      0x51 -> oneWord (SM.CJMP "nz" . fromIntegral)
+      0x52 -> twoWords SM.BEGIN
+      0x53 -> twoWords SM.BEGIN
       0x54 -> closureInstruction
       0x55 -> oneWord (SM.CALLC . fromIntegral)
-      0x56 -> twoWords (SM.CALL . codeLabel)
+      0x56 -> twoWords SM.CALL
       0x57 -> namedFields SM.TAG
       0x58 -> oneWord (SM.ARRAY . fromIntegral)
       0x59 -> twoWords (\lineNumber columnNumber -> SM.FAIL (lineNumber, columnNumber))
@@ -234,11 +244,11 @@ decodeInstruction bytecodeFile codeLabel codeOffset opcode operandBytes
       0x64 -> noOperands (SM.PATT SM.Boxed)
       0x65 -> noOperands (SM.PATT SM.UnBoxed)
       0x66 -> noOperands (SM.PATT SM.PClosure)
-      0x70 -> noOperands (SM.CALL "read" 0)
-      0x71 -> noOperands (SM.CALL "write" 1)
-      0x72 -> noOperands (SM.CALL "length" 1)
-      0x73 -> noOperands (SM.CALL "string" 1)
-      0x74 -> oneWord (SM.CALL ".array" . fromIntegral)
+      0x70 -> noOperands (SM.BUILTIN "read" 0)
+      0x71 -> noOperands (SM.BUILTIN "write" 1)
+      0x72 -> noOperands (SM.BUILTIN "length" 1)
+      0x73 -> noOperands (SM.BUILTIN "string" 1)
+      0x74 -> oneWord (SM.BUILTIN ".array" . fromIntegral)
       _ -> invalidOpcode
   where
     invalidOpcode :: Either ParseError (SM.Insn, BS.ByteString)
@@ -276,7 +286,7 @@ decodeInstruction bytecodeFile codeLabel codeOffset opcode operandBytes
       (entryOffset, afterEntry) <- readWord32LE operandBytes
       (captureCount, afterCount) <- readWord32LE afterEntry
       (captures, remainingBytes) <- readCaptures captureCount afterCount []
-      pure (SM.CLOSURE (codeLabel (fromIntegral entryOffset)) captures, remainingBytes)
+      pure (SM.CLOSURE (fromIntegral entryOffset) captures, remainingBytes)
 
     readCaptures :: Word32 -> BS.ByteString -> [SM.Designation] -> Either ParseError ([SM.Designation], BS.ByteString)
     readCaptures remainingCount remainingBytes captures
@@ -312,6 +322,3 @@ readStringAt offsetDescription stringDescription stringTable stringOffset
       in if BS.null terminatorAndRest
            then Left (InvalidBytecode ("Unterminated " ++ stringDescription))
            else Right (BSC.unpack stringBytes)
-
-isBuiltinName :: String -> Bool
-isBuiltinName functionName = functionName `elem` ["read", "write", "length", "string", ".array"]

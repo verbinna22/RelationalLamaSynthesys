@@ -44,33 +44,55 @@ data MemoryAddressMapping = MemoryAddressMapping
   , x86ToSMAddresses :: M.Map Int Int
   } deriving (Show, Eq)
 
-equalsStates :: M.Map Int String -> M.Map String Int -> SM.Config -> X.State -> Bool
-equalsStates entryAddressToFunctionName globalNameToAddress smState x86State =
+equalsStates :: SM.Prog -> M.Map Int String -> M.Map String Int -> Bool -> Bool -> SM.Config -> X.State -> Bool
+equalsStates program entryAddressToFunctionName globalNameToAddress hasFrames lastInstructionWasCall smState x86State =
   isJust $ do
     guard (SM.inp smState == X.stInput x86State)
     guard (SM.out smState == X.stOutput x86State)
-    mappingAfterGlobals <- equalGlobals entryAddressToFunctionName globalNameToAddress
+    mappingAfterGlobals <- equalGlobals functionNames entryAddressToFunctionName globalNameToAddress
       smState x86State initialAddressMapping
-    equalFrames entryAddressToFunctionName smState x86State mappingAfterGlobals
+    frameBase <- M.lookup X.RBP (X.stRegs x86State)
+    if not hasFrames
+      then do
+        guard (not lastInstructionWasCall && frameBase == 0)
+        Just mappingAfterGlobals
+      else if lastInstructionWasCall
+        then do
+          let callerSMState = returnSMToCaller smState
+          guard (IM.null (SM.locLocals (SM.loc smState)))
+          guard (length (SM.stk smState) == maybe 0 (length . SM.stk) callerSMState)
+          callerX86State <- returnX86BeforePrologue program smState x86State
+          case callerSMState of
+            Just callerState ->
+              equalFrames program entryAddressToFunctionName callerState callerX86State mappingAfterGlobals
+            Nothing -> do
+              guard (frameBase == 0)
+              Just mappingAfterGlobals
+        else do
+          guard (frameBase /= 0)
+          equalFrames program entryAddressToFunctionName smState x86State mappingAfterGlobals
   where
+    functionNames :: IM.IntMap String
+    functionNames = SM.programFunctionNames program
+
     initialAddressMapping :: MemoryAddressMapping
     initialAddressMapping = MemoryAddressMapping M.empty M.empty
 
-equalFrames :: M.Map Int String -> SM.Config -> X.State
+equalFrames :: SM.Prog -> M.Map Int String -> SM.Config -> X.State
             -> MemoryAddressMapping -> Maybe MemoryAddressMapping
-equalFrames entryAddressToFunctionName smState x86State addressMapping = do
-  mappingAfterFrame <- checkStackFrame entryAddressToFunctionName smState x86State addressMapping
-  case (returnSMToCaller smState, returnX86ToCaller smState x86State) of
+equalFrames program entryAddressToFunctionName smState x86State addressMapping = do
+  mappingAfterFrame <- checkStackFrame (SM.programFunctionNames program) entryAddressToFunctionName smState x86State addressMapping
+  case (returnSMToCaller smState, returnX86ToCaller program smState x86State) of
     (Just callerSMState, Just callerX86State) ->
-      equalFrames entryAddressToFunctionName callerSMState callerX86State mappingAfterFrame
+      equalFrames program entryAddressToFunctionName callerSMState callerX86State mappingAfterFrame
     (Nothing, Nothing) -> Just mappingAfterFrame
     _ -> Nothing
 
-equalGlobals :: M.Map Int String -> M.Map String Int -> SM.Config -> X.State
+equalGlobals :: IM.IntMap String -> M.Map Int String -> M.Map String Int -> SM.Config -> X.State
              -> MemoryAddressMapping -> Maybe MemoryAddressMapping
-equalGlobals entryAddressToFunctionName globalNameToAddress smState x86State addressMapping = do
+equalGlobals functionNames entryAddressToFunctionName globalNameToAddress smState x86State addressMapping = do
   valuePairs <- traverse globalValuePair (M.toList (SM.glob smState))
-  equalValues entryAddressToFunctionName smState x86State valuePairs addressMapping
+  equalValues functionNames entryAddressToFunctionName smState x86State valuePairs addressMapping
   where
     globalValuePair :: (String, SM.Value) -> Maybe (SM.Value, Int)
     globalValuePair (globalName, smValue) = do
@@ -78,18 +100,17 @@ equalGlobals entryAddressToFunctionName globalNameToAddress smState x86State add
       x86Value <- M.lookup globalAddress (X.stGlob x86State)
       pure (smValue, x86Value)
 
-equalValues :: M.Map Int String -> SM.Config -> X.State -> [(SM.Value, Int)]
+equalValues :: IM.IntMap String -> M.Map Int String -> SM.Config -> X.State -> [(SM.Value, Int)]
             -> MemoryAddressMapping -> Maybe MemoryAddressMapping
-equalValues _ _ _ [] addressMapping = Just addressMapping
-equalValues entryAddressToFunctionName smState x86State ((smValue, x86Value) : remainingPairs) addressMapping =
+equalValues _ _ _ _ [] addressMapping = Just addressMapping
+equalValues functionNames entryAddressToFunctionName smState x86State ((smValue, x86Value) : remainingPairs) addressMapping =
   case smValue of
     SM.VInt number -> continueIf (toInteger x86Value == 2 * number + 1)
     SM.VEmpty -> continueIf (x86Value == 1)
-    SM.VBuiltin functionName -> do
+    SM.VBuiltin _ -> do
       guard (even x86Value)
       case M.lookup x86Value (X.stMem x86State) of
-        Just (X.MemClosure entryAddress captured) ->
-          continueIf (M.lookup entryAddress entryAddressToFunctionName == Just functionName && null captured)
+        Just (X.MemClosure _ captured) -> continueIf (null captured)
         _ -> Nothing
     SM.VString smAddress -> compareHeapReference smAddress
     SM.VArray smAddress -> compareHeapReference smAddress
@@ -99,7 +120,7 @@ equalValues entryAddressToFunctionName smState x86State ((smValue, x86Value) : r
     continueIf :: Bool -> Maybe MemoryAddressMapping
     continueIf valuesMatch = do
       guard valuesMatch
-      equalValues entryAddressToFunctionName smState x86State remainingPairs addressMapping
+      equalValues functionNames entryAddressToFunctionName smState x86State remainingPairs addressMapping
 
     compareHeapReference :: Int -> Maybe MemoryAddressMapping
     compareHeapReference smAddress =
@@ -115,7 +136,7 @@ equalValues entryAddressToFunctionName smState x86State ((smValue, x86Value) : r
                 , x86ToSMAddresses = M.insert x86Value smAddress (x86ToSMAddresses addressMapping)
                 }
           fieldPairs <- heapFieldPairs smAddress
-          equalValues entryAddressToFunctionName smState x86State
+          equalValues functionNames entryAddressToFunctionName smState x86State
             (fieldPairs ++ remainingPairs) extendedMapping
         _ -> Nothing
 
@@ -130,9 +151,7 @@ equalValues entryAddressToFunctionName smState x86State ((smValue, x86Value) : r
           expectedTag <- boxedTag tag
           guard (expectedTag == toInteger actualTag)
           pure fields
-        (SM.VClosure functionName _, X.MemClosure entryAddress captured) -> do
-          guard (M.lookup entryAddress entryAddressToFunctionName == Just functionName)
-          pure captured
+        (SM.VClosure _ _, X.MemClosure _ captured) -> pure captured
         _ -> Nothing
       guard (length smFields == length x86Fields)
       pure (zip smFields x86Fields)
@@ -150,32 +169,34 @@ equalValues entryAddressToFunctionName smState x86State ((smValue, x86Value) : r
       characterIndex <- elemIndex character "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'"
       pure (accumulatedHash * 64 + toInteger characterIndex)
 
-checkStackFrame :: M.Map Int String -> SM.Config -> X.State
+checkStackFrame :: IM.IntMap String -> M.Map Int String -> SM.Config -> X.State
                  -> MemoryAddressMapping -> Maybe MemoryAddressMapping
-checkStackFrame entryAddressToFunctionName smState x86State addressMapping = do
+checkStackFrame functionNames entryAddressToFunctionName smState x86State addressMapping = do
   frameBase <- M.lookup X.RBP (X.stRegs x86State)
   callerFrameBase <- M.lookup frameBase (X.stkCells (X.stStack x86State))
   guard (callerFrameBase > frameBase)
-  mappingAfterLocals <- checkLocals entryAddressToFunctionName smState x86State addressMapping
-  mappingAfterArgs <- checkArgs entryAddressToFunctionName smState x86State mappingAfterLocals
-  mappingAfterClosure <- checkClosure entryAddressToFunctionName smState x86State mappingAfterArgs
-  checkStack entryAddressToFunctionName smState x86State mappingAfterClosure
+  mappingAfterLocals <- checkLocals functionNames entryAddressToFunctionName smState x86State addressMapping
+  mappingAfterArgs <- checkArgs functionNames entryAddressToFunctionName smState x86State mappingAfterLocals
+  mappingAfterClosure <- checkClosure functionNames entryAddressToFunctionName smState x86State mappingAfterArgs
+  checkStack functionNames entryAddressToFunctionName smState x86State mappingAfterClosure
 
-checkLocals :: M.Map Int String -> SM.Config -> X.State -> MemoryAddressMapping -> Maybe MemoryAddressMapping
-checkLocals entryAddressToFunctionName smState x86State addressMapping = do
+checkLocals :: IM.IntMap String -> M.Map Int String -> SM.Config -> X.State -> MemoryAddressMapping -> Maybe MemoryAddressMapping
+checkLocals functionNames entryAddressToFunctionName smState x86State addressMapping = do
   frameBase <- M.lookup X.RBP (X.stRegs x86State)
-  valuePairs <- traverse (localValuePair frameBase) (IM.toList (SM.locLocals (SM.loc smState)))
-  equalValues entryAddressToFunctionName smState x86State valuePairs addressMapping
+  valuePairs <- traverse (localValuePair frameBase)
+    (IM.toList (IM.filter (/= SM.VEmpty) (SM.locLocals (SM.loc smState))))
+  equalValues functionNames entryAddressToFunctionName smState x86State valuePairs addressMapping
   where
     localValuePair :: Int -> (Int, SM.Value) -> Maybe (SM.Value, Int)
-    localValuePair frameBase (localIndex, smValue) = do
-      x86Value <- M.lookup (frameSlotAddress frameBase localIndex) (X.stkCells (X.stStack x86State))
-      pure (smValue, x86Value)
+    localValuePair frameBase (localIndex, smValue) =
+      case M.lookup (frameSlotAddress frameBase localIndex) (X.stkCells (X.stStack x86State)) of
+        Just x86Value -> Just (smValue, x86Value)
+        Nothing -> Nothing
 
-checkArgs :: M.Map Int String -> SM.Config -> X.State -> MemoryAddressMapping -> Maybe MemoryAddressMapping
-checkArgs entryAddressToFunctionName smState x86State addressMapping
+checkArgs :: IM.IntMap String -> M.Map Int String -> SM.Config -> X.State -> MemoryAddressMapping -> Maybe MemoryAddressMapping
+checkArgs functionNames entryAddressToFunctionName smState x86State addressMapping
   | null (SM.cstack smState) = Just addressMapping
-  | otherwise = equalValues entryAddressToFunctionName smState x86State
+  | otherwise = equalValues functionNames entryAddressToFunctionName smState x86State
       (zip (IM.elems (SM.locArgs (SM.loc smState))) x86ArgumentValues) addressMapping
   where
     frameBase :: Int
@@ -186,8 +207,8 @@ checkArgs entryAddressToFunctionName smState x86State addressMapping
       map (X.stRegs x86State !) argumentRegisters
         ++ map (X.stkCells (X.stStack x86State) !) (stackArgumentAddresses frameBase)
 
-checkClosure :: M.Map Int String -> SM.Config -> X.State -> MemoryAddressMapping -> Maybe MemoryAddressMapping
-checkClosure entryAddressToFunctionName smState x86State addressMapping =
+checkClosure :: IM.IntMap String -> M.Map Int String -> SM.Config -> X.State -> MemoryAddressMapping -> Maybe MemoryAddressMapping
+checkClosure functionNames entryAddressToFunctionName smState x86State addressMapping =
   case SM.locClosure (SM.loc smState) of
     Nothing -> Just addressMapping
     Just closureId -> do
@@ -208,13 +229,13 @@ checkClosure entryAddressToFunctionName smState x86State addressMapping =
                 guard (mappedX86 == x86ClosureAddress && mappedSM == closureId)
                 Just addressMapping
               _ -> Nothing
-            equalValues entryAddressToFunctionName smState x86State
+            equalValues functionNames entryAddressToFunctionName smState x86State
               (zip capturedValues x86CapturedValues) mappingAfterClosure
           _ -> Nothing
 
-checkStack :: M.Map Int String -> SM.Config -> X.State -> MemoryAddressMapping -> Maybe MemoryAddressMapping
-checkStack entryAddressToFunctionName smState x86State addressMapping =
-  equalValues entryAddressToFunctionName smState x86State
+checkStack :: IM.IntMap String -> M.Map Int String -> SM.Config -> X.State -> MemoryAddressMapping -> Maybe MemoryAddressMapping
+checkStack functionNames entryAddressToFunctionName smState x86State addressMapping =
+  equalValues functionNames entryAddressToFunctionName smState x86State
     (zip currentFrameOperands x86OperandValues) addressMapping
   where
     callerStackSize :: Int
@@ -242,10 +263,18 @@ returnSMToCaller smState = case SM.cstack smState of
       , SM.stk = stackBeforeCall
       }
 
-returnX86ToCaller :: SM.Config -> X.State -> Maybe X.State
-returnX86ToCaller smState x86State
+returnX86BeforePrologue :: SM.Prog -> SM.Config -> X.State -> Maybe X.State
+returnX86BeforePrologue program smState x86State = do
+  stackPointer <- M.lookup X.RSP (X.stRegs x86State)
+  frameBase <- M.lookup X.RBP (X.stRegs x86State)
+  guard (stackPointer < frameBase)
+  (_, callerState) <- either (const Nothing) Just (X.stackPop x86State)
+  pure (restoreX86CallerRegistersAndStack program smState callerState)
+
+returnX86ToCaller :: SM.Prog -> SM.Config -> X.State -> Maybe X.State
+returnX86ToCaller program smState x86State
   | callerFrameBase == 0 = Nothing
-  | otherwise = Just (restoreX86CallerRegistersAndStack smState stateWithRestoredRBP)
+  | otherwise = Just (restoreX86CallerRegistersAndStack program smState stateWithRestoredRBP)
   where
     frameBase :: Int
     frameBase = X.stRegs x86State ! X.RBP
@@ -262,12 +291,12 @@ returnX86ToCaller smState x86State
         (M.insert X.RSP (savedSP frameBase) (X.stRegs x86State))
       }
 
-restoreX86CallerRegistersAndStack :: SM.Config -> X.State -> X.State
-restoreX86CallerRegistersAndStack smState stateWithRestoredRBP =
+restoreX86CallerRegistersAndStack :: SM.Prog -> SM.Config -> X.State -> X.State
+restoreX86CallerRegistersAndStack program smState stateWithRestoredRBP =
   foldl' restoreSavedRegister stateAfterArguments (reverse savedRegisters)
   where
     savedRegisters :: [X.Register]
-    savedRegisters = savedCallerRegisters smState
+    savedRegisters = savedCallerRegisters program smState
 
     stackArgumentCount :: Int
     stackArgumentCount = callStackArgumentCount smState
@@ -296,10 +325,10 @@ restoreX86CallerRegistersAndStack smState stateWithRestoredRBP =
         stackCells :: M.Map Int Int
         stackCells = X.stkCells (X.stStack currentState)
 
-savedCallerRegisters :: SM.Config -> [X.Register]
-savedCallerRegisters smState = case SM.cstack smState of
+savedCallerRegisters :: SM.Prog -> SM.Config -> [X.Register]
+savedCallerRegisters program smState = case SM.cstack smState of
   [] -> []
-  (_, callerLocals, callerStack) : olderFrames ->
+  (returnAddress, callerLocals, callerStack) : olderFrames ->
     let olderStackSize :: Int
         olderStackSize = case olderFrames of
           [] -> 0
@@ -307,7 +336,9 @@ savedCallerRegisters smState = case SM.cstack smState of
 
         savedOperandCount :: Int
         savedOperandCount = length callerStack - olderStackSize
-          + fromEnum (isJust (SM.locClosure (SM.loc smState)))
+          + case IM.lookup (returnAddress - 1) (SM.programInstructions program) of
+              Just (SM.CALLC _) -> 1
+              _ -> 0
 
         callerArgumentCount :: Int
         callerArgumentCount = if null olderFrames then 2 else IM.size (SM.locArgs callerLocals)

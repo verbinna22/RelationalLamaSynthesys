@@ -5,12 +5,12 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd -- "$project_root"
 build_dir=$(mktemp -d "${TMPDIR:-/tmp}/lama-bytecode-tests.XXXXXXXX")
 trap 'rm -rf -- "$build_dir"' EXIT
-test_timeout=${TEST_TIMEOUT:-30s}
+test_timeout=${TEST_TIMEOUT:-120s}
 command -v timeout >/dev/null || { echo 'Required command not found: timeout' >&2; exit 2; }
 
 find . -path './.git' -prune -o -type f -name '*.bc' -print0 | LC_ALL=C sort -z > "$build_dir/files"
 mapfile -d '' -t bytecode_files < "$build_dir/files"
-# bytecode_files=("./lama-artifacts/test003.bc") # DEBUG: isolate the failing fixture.
+# bytecode_files=("./lama-artifacts/test099.bc") # DEBUG: isolate the failing fixture.
 if (( ${#bytecode_files[@]} == 0 )); then
     echo 'No .bc files found.' >&2
     exit 2

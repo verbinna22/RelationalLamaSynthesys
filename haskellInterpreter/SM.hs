@@ -23,7 +23,7 @@ data Value
   | VString Int
   | VArray  Int
   | VSexp   String Int
-  | VClosure String Int
+  | VClosure Int Int
   | VBuiltin String
   | VEmpty
   deriving (Show, Eq)
@@ -37,14 +37,17 @@ data Insn
   | ST Designation
   | STA
   | ELEM
-  | LABEL String
-  | JMP String
-  | CJMP String String
-  | BEGIN String Int Int
+  | JMP Int
+  | CJMP String Int
+  | BEGIN Int Int
   | END
-  | CLOSURE String [Designation]
+  | CLOSURE Int [Designation]
   | CALLC Int
-  | CALL String Int
+  | CALL Int Int
+  | BUILTIN String Int
+  | CALL_TAIL Int Int
+  | CALLC_TAIL Int
+  | BUILTIN_TAIL String Int
   | RET
   | DROP
   | DUP
@@ -56,7 +59,11 @@ data Insn
   | LINE Int
   deriving (Show, Eq)
 
-type Prog = [Insn]
+data Prog = Prog
+  { programInstructions :: IM.IntMap Insn
+  , programEntry :: Int
+  , programFunctionNames :: IM.IntMap String
+  } deriving (Show, Eq)
 
 data Loc = Loc
   { locArgs    :: IM.IntMap Value
@@ -70,7 +77,7 @@ emptyLoc = Loc IM.empty IM.empty Nothing
 type Store = IM.IntMap [Value]
 
 data Config = Config
-  { cstack :: [(Prog, Loc, [Value])]
+  { cstack :: [(Int, Loc, [Value])]
   , stk    :: [Value]
   , glob   :: M.Map String Value
   , loc    :: Loc
@@ -92,18 +99,18 @@ initialConfig i = Config
   , nextId = 0
   }
 
-type LabelEnv = M.Map String Prog
+initialState :: Prog -> [Int] -> SM Config
+initialState program inputs = case IM.lookup (programEntry program) (programInstructions program) of
+  Just (BEGIN _ _) -> Right (initialConfig inputs)
+  _ -> throwSM "main does not point to BEGIN"
 
-collectLabels :: Prog -> LabelEnv
-collectLabels []                = M.empty
-collectLabels (LABEL l : rest) = M.insert l rest (collectLabels rest)
-collectLabels (_       : rest) = collectLabels rest
+finished :: Prog -> Int -> Bool
+finished program instructionAddress = instructionAddress == IM.size (programInstructions program)
 
-initialEnv :: Prog -> LabelEnv
-initialEnv = collectLabels
-
-initialState :: Prog -> [Int] -> (LabelEnv, Config)
-initialState p i = (collectLabels p, initialConfig i)
+currentInstruction :: Prog -> Int -> SM Insn
+currentInstruction program instructionAddress = case IM.lookup instructionAddress (programInstructions program) of
+  Just instruction -> Right instruction
+  Nothing -> throwSM ("Invalid instruction address: " ++ show instructionAddress)
 
 type SM = Either String
 
@@ -206,78 +213,86 @@ replaceAtSM i x xs
   | i < 0 || i >= length xs = throwSM ("replaceAt: index out of bounds " ++ show i)
   | otherwise               = pure (take i xs ++ [x] ++ drop (i + 1) xs)
 
-showValue :: Store -> Value -> String
-showValue s (VInt n)    = show n
-showValue s (VString i) = case IM.lookup i s of
+showValue :: Prog -> Config -> Value -> String
+showValue program s (VInt n) = show n
+showValue program s (VString i) = case IM.lookup i (store s) of
   Nothing -> "<string#?>"
   Just vs -> "\"" ++ concatMap renderChar vs ++ "\""
-  where renderChar (VInt c) = [toEnum (fromIntegral c)]
-        renderChar _        = "?"
-showValue valueStore (VArray objectId) = case IM.lookup objectId valueStore of
+  where
+    renderChar :: Value -> String
+    renderChar (VInt c) = [toEnum (fromIntegral c)]
+    renderChar _ = "?"
+showValue program state (VArray objectId) = case IM.lookup objectId (store state) of
   Nothing -> "<array#?>"
-  Just elements -> "[" ++ intercalate ", " (map (showValue valueStore) elements) ++ "]"
-showValue valueStore (VSexp tag objectId) = case IM.lookup objectId valueStore of
+  Just elements -> "[" ++ intercalate ", " (map (showValue program state) elements) ++ "]"
+showValue program state (VSexp tag objectId) = case IM.lookup objectId (store state) of
   Nothing -> "<" ++ tag ++ "#?>"
   Just [] -> tag
-  Just fields -> tag ++ " (" ++ intercalate ", " (map (showValue valueStore) fields) ++ ")"
-showValue s (VClosure n _) = "<closure " ++ n ++ ">"
-showValue _ (VBuiltin n)   = "<builtin " ++ n ++ ">"
-showValue s VEmpty         = "<empty>"
+  Just fields -> tag ++ " (" ++ intercalate ", " (map (showValue program state) fields) ++ ")"
+showValue program state (VClosure entryAddress _) =
+  "<closure " ++ IM.findWithDefault (show entryAddress) entryAddress (programFunctionNames program) ++ ">"
+showValue program _ (VBuiltin n) = "<builtin " ++ n ++ ">"
+showValue program s VEmpty = "<empty>"
 
-builtin :: String -> [Value] -> Config -> SM Config
-builtin "read" _ c = case inp c of
+builtin :: Prog -> String -> [Value] -> Config -> SM Config
+builtin program "read" _ c = case inp c of
   (x:xs) -> pure c { inp = xs, stk = VInt (fromIntegral x) : stk c }
   []     -> throwSM "read: no input available"
 
-builtin "write" [VInt n] c = pure c { out = out c ++ [fromIntegral n], stk = VEmpty : stk c }
-builtin "write" args _     = throwSM ("write: bad args " ++ show args)
+builtin program "write" [VInt n] c = pure c { out = out c ++ [fromIntegral n], stk = VEmpty : stk c }
+builtin program "write" args _     = throwSM ("write: bad args " ++ show args)
 
-builtin "length" [VString i] c = do
+builtin program "length" [VString i] c = do
   vs <- lookupStore i c
   pure c { stk = VInt (fromIntegral (length vs)) : stk c }
-builtin "length" [VArray i] c = do
+builtin program "length" [VArray i] c = do
   vs <- lookupStore i c
   pure c { stk = VInt (fromIntegral (length vs)) : stk c }
-builtin "length" [VSexp _ i] c = do
+builtin program "length" [VSexp _ i] c = do
   vs <- lookupStore i c
   pure c { stk = VInt (fromIntegral (length vs)) : stk c }
-builtin "length" args _ = throwSM ("length: bad args " ++ show args)
+builtin program "length" args _ = throwSM ("length: bad args " ++ show args)
 
-builtin "string" [v] c = do
-  let str = showValue (store c) v
+builtin program "string" [v] c = do
+  let str = showValue program c v
       vs  = map (VInt . fromIntegral . fromEnum) str
       (i, c') = allocStore vs c
   pure c' { stk = VString i : stk c }
-builtin "string" args _ = throwSM ("string: bad args " ++ show args)
+builtin program "string" args _ = throwSM ("string: bad args " ++ show args)
 
-builtin ".array" elements config =
+builtin program ".array" elements config =
   let (arrayId, allocatedConfig) = allocStore elements config
   in pure allocatedConfig { stk = VArray arrayId : stk allocatedConfig }
 
-builtin name _ _ = throwSM ("unknown builtin: " ++ name)
+builtin program name _ _ = throwSM ("unknown builtin: " ++ name)
 
-step :: LabelEnv -> Config -> Prog -> SM (Config, Prog)
-step _   conf [] = pure (conf, [])
-step env conf (insn : rest) = case insn of
+step :: Prog -> Config -> Int -> SM (Config, Int)
+step program state instructionAddress
+  | finished program instructionAddress = Right (state, instructionAddress)
+  | otherwise = do
+      instruction <- currentInstruction program instructionAddress
+      executeInstruction program state instruction (instructionAddress + 1)
 
-  LINE _  -> pure (conf, rest)
-  LABEL _ -> pure (conf, rest)
+executeInstruction :: Prog -> Config -> Insn -> Int -> SM (Config, Int)
+executeInstruction program conf insn nextAddress = case insn of
 
-  CONST n -> pure (conf { stk = VInt n : stk conf }, rest)
+  LINE _  -> pure (conf, nextAddress)
+
+  CONST n -> pure (conf { stk = VInt n : stk conf }, nextAddress)
 
   STRING s -> do
     let vs = map (VInt . fromIntegral . fromEnum) s
         (i, conf') = allocStore vs conf
-    pure (conf' { stk = VString i : stk conf }, rest)
+    pure (conf' { stk = VString i : stk conf }, nextAddress)
 
   SEXP tag n -> do
     (vs, rest') <- splitStack n (stk conf)
     let (i, conf') = allocStore (reverse vs) conf
-    pure (conf' { stk = VSexp tag i : rest' }, rest)
+    pure (conf' { stk = VSexp tag i : rest' }, nextAddress)
 
   BINOP "==" -> case stk conf of
     (rightValue : leftValue : remainingStack) ->
-      pure (conf { stk = VInt (b2i (sameValue leftValue rightValue)) : remainingStack }, rest)
+      pure (conf { stk = VInt (b2i (sameValue leftValue rightValue)) : remainingStack }, nextAddress)
     _ -> throwSM "BINOP ==: stack underflow"
 
   BINOP op -> case stk conf of
@@ -285,7 +300,7 @@ step env conf (insn : rest) = case insn of
       a <- toInt x
       b <- toInt y
       z <- binopFunc op a b
-      pure (conf { stk = VInt z : rest' }, rest)
+      pure (conf { stk = VInt z : rest' }, nextAddress)
     _ -> throwSM ("BINOP " ++ op ++ ": stack underflow")
 
   ELEM -> case stk conf of
@@ -300,17 +315,17 @@ step env conf (insn : rest) = case insn of
         then throwSM ("ELEM: index out of bounds: " ++ show elementIndex)
         else do
           element <- safeIndex elements (fromInteger elementIndex) "ELEM"
-          pure (conf { stk = element : remainingStack }, rest)
+          pure (conf { stk = element : remainingStack }, nextAddress)
     _ -> throwSM "ELEM: stack underflow"
 
   LD x -> do
     v <- lookupDesignation conf x
-    pure (conf { stk = v : stk conf }, rest)
+    pure (conf { stk = v : stk conf }, nextAddress)
 
   ST x -> case stk conf of
     (z : rest') -> do
       updatedState <- updateDesignation conf z x
-      pure (updatedState, rest)
+      pure (updatedState, nextAddress)
     _ -> throwSM "ST: stack underflow"
 
   STA -> case stk conf of
@@ -333,13 +348,13 @@ step env conf (insn : rest) = case insn of
               vs' <- replaceAtSM i z vs
               updateStore id vs' conf
             _ -> throwSM ("STA: not a container: " ++ show container)
-          pure (conf' { stk = z : rest'' }, rest)
+          pure (conf' { stk = z : rest'' }, nextAddress)
         _ -> throwSM "STA: stack underflow"
       _ -> throwSM "STA: bad stack shape"
     _ -> throwSM "STA: stack underflow"
 
   JMP l -> do
-    p <- jumpTo env l
+    p <- jumpTo program l
     pure (conf, p)
 
   CJMP c l -> case stk conf of
@@ -348,31 +363,32 @@ step env conf (insn : rest) = case insn of
       let take_ = (c == "z" && n == 0) || (c == "nz" && n /= 0)
       if take_
         then do
-          p <- jumpTo env l
+          p <- jumpTo program l
           pure (conf { stk = rest' }, p)
         else
-          pure (conf { stk = rest' }, rest)
+          pure (conf { stk = rest' }, nextAddress)
     _ -> throwSM "CJMP: stack underflow"
 
   CLOSURE name dgs -> do
     cl <- mapM (capture conf) dgs
     let (ident, conf') = allocStore cl conf
-    pure (conf' { stk = VClosure name ident : stk conf }, rest)
+    pure (conf' { stk = VClosure name ident : stk conf }, nextAddress)
 
   CALL f n -> do
     (args, rest') <- splitStack n (stk conf)
-    case M.lookup f env of
-      Just body -> do
-        let argsMap = IM.fromList (zip [0..] (reverse args))
-        let newLoc = Loc { locArgs    = argsMap
-                         , locLocals  = IM.empty
-                         , locClosure = Nothing }
-        pure (conf { cstack = (rest, loc conf, rest') : cstack conf
-                   , stk    = rest'
-                   , loc    = newLoc }, body)
-      Nothing -> do
-        c <- builtin f (reverse args) (conf { stk = rest' })
-        pure (c, rest)
+    body <- jumpTo program f
+    let argsMap = IM.fromList (zip [0..] (reverse args))
+    let newLoc = Loc { locArgs = argsMap
+                     , locLocals = IM.empty
+                     , locClosure = Nothing }
+    pure (conf { cstack = (nextAddress, loc conf, rest') : cstack conf
+               , stk = rest'
+               , loc = newLoc }, body)
+
+  BUILTIN functionName argumentCount -> do
+    (arguments, callerStack) <- splitStack argumentCount (stk conf)
+    returnedState <- builtin program functionName (reverse arguments) (conf { stk = callerStack })
+    pure (returnedState, nextAddress)
 
   CALLC n -> do
     (vs, rest') <- splitStack (n + 1) (stk conf)
@@ -380,41 +396,69 @@ step env conf (insn : rest) = case insn of
       (VClosure name ident : args) -> do
         _ <- lookupStore ident conf
         let argsMap = IM.fromList (zip [0..] args)
-        let newLoc = Loc { locArgs    = argsMap
-                         , locLocals  = IM.empty
+        let newLoc = Loc { locArgs = argsMap
+                         , locLocals = IM.empty
                          , locClosure = Just ident }
-        p <- jumpTo env name
-        pure (conf { cstack = (rest, loc conf, rest') : cstack conf
-                   , stk    = rest'
-                   , loc    = newLoc }, p)
+        p <- jumpTo program name
+        pure (conf { cstack = (nextAddress, loc conf, rest') : cstack conf
+                   , stk = rest'
+                   , loc = newLoc }, p)
       (VBuiltin name : args) -> do
-        c <- builtin name args (conf { stk = rest' })
-        pure (c, rest)
+        c <- builtin program name args (conf { stk = rest' })
+        pure (c, nextAddress)
       (f : _) -> throwSM ("CALLC: not callable: " ++ show f)
-      []      -> throwSM "CALLC: empty stack"
+      [] -> throwSM "CALLC: empty stack"
 
-  BEGIN _ _ nlocals -> do
+  CALL_TAIL f n -> do
+    (args, rest') <- splitStack n (stk conf)
+    body <- jumpTo program f
+    let argsMap = IM.fromList (zip [0..] (reverse args))
+    let newLoc = Loc { locArgs = argsMap
+                     , locLocals = IM.empty
+                     , locClosure = Nothing }
+    pure (conf { stk = rest', loc = newLoc }, body)
+
+  CALLC_TAIL n -> do
+    (vs, rest') <- splitStack (n + 1) (stk conf)
+    case reverse vs of
+      (VClosure name ident : args) -> do
+        _ <- lookupStore ident conf
+        let argsMap = IM.fromList (zip [0..] args)
+        let newLoc = Loc { locArgs = argsMap
+                         , locLocals = IM.empty
+                         , locClosure = Just ident }
+        p <- jumpTo program name
+        pure (conf { stk = rest', loc = newLoc }, p)
+      (VBuiltin name : args) -> do
+        (returnedState, returnAddress) <- returnFromCall program (conf { stk = rest' })
+        c <- builtin program name args returnedState
+        pure (c, returnAddress)
+      (f : _) -> throwSM ("CALLC_TAIL: not callable: " ++ show f)
+      [] -> throwSM "CALLC_TAIL: empty stack"
+
+  BUILTIN_TAIL functionName argumentCount -> do
+    (arguments, callerStack) <- splitStack argumentCount (stk conf)
+    (returnedState, returnAddress) <- returnFromCall program (conf { stk = callerStack })
+    calledState <- builtin program functionName (reverse arguments) returnedState
+    pure (calledState, returnAddress)
+
+  BEGIN _ nlocals -> do
     let localsMap = IM.fromList (zip [0..] (replicate nlocals VEmpty))
-    pure (conf { loc = (loc conf) { locLocals = localsMap } }, rest)
+    pure (conf { loc = (loc conf) { locLocals = localsMap } }, nextAddress)
 
-  END -> case cstack conf of
-    ((p, l, _) : cs) -> pure (conf { cstack = cs, loc = l }, p)
-    []            -> pure (conf, [])
-
-  RET -> case cstack conf of
-    ((p, l, _) : cs) -> pure (conf { cstack = cs, loc = l }, p)
-    []            -> pure (conf, [])
+  END -> returnFromCall program conf
+  RET -> returnFromCall program conf
 
   DROP -> case stk conf of
-    (_ : rest') -> pure (conf { stk = rest' }, rest)
+    (_ : rest') -> pure (conf { stk = rest' }, nextAddress)
     _           -> throwSM "DROP: stack underflow"
 
   DUP -> case stk conf of
-    (x : _) -> pure (conf { stk = x : stk conf }, rest)
+    (x : _) -> pure (conf { stk = x : stk conf }, nextAddress)
     _       -> throwSM "DUP: stack underflow"
 
   SWAP -> case stk conf of
-    (x : y : rest') -> pure (conf { stk = y : x : rest' }, rest)
+    (x : y : rest') -> pure (conf { stk = y : x : rest' }, nextAddress)
     _               -> throwSM "SWAP: stack underflow"
 
   TAG t n -> case stk conf of
@@ -424,7 +468,7 @@ step env conf (insn : rest) = case insn of
                vs <- lookupStore id conf
                pure (b2i (length vs == n))
              _ -> pure 0
-      pure (conf { stk = VInt v : rest' }, rest)
+      pure (conf { stk = VInt v : rest' }, nextAddress)
     _ -> throwSM "TAG: stack underflow"
 
   ARRAY n -> case stk conf of
@@ -434,7 +478,7 @@ step env conf (insn : rest) = case insn of
                vs <- lookupStore id conf
                pure (b2i (length vs == n))
              _ -> pure 0
-      pure (conf { stk = VInt v : rest' }, rest)
+      pure (conf { stk = VInt v : rest' }, nextAddress)
     _ -> throwSM "ARRAY: stack underflow"
 
   PATT p -> case p of
@@ -446,67 +490,72 @@ step env conf (insn : rest) = case insn of
                   vs2 <- lookupStore i2 conf
                   pure (vs1 == vs2)
                 _ -> pure False
-        pure (conf { stk = VInt (b2i eq) : rest' }, rest)
+        pure (conf { stk = VInt (b2i eq) : rest' }, nextAddress)
       _ -> throwSM "PATT StrCmp: stack underflow"
     PArray -> case stk conf of
       (x : rest') ->
         let v = case x of VArray _ -> 1; _ -> 0
-        in pure (conf { stk = VInt v : rest' }, rest)
+        in pure (conf { stk = VInt v : rest' }, nextAddress)
       _ -> throwSM "PATT Array: stack underflow"
     PString -> case stk conf of
       (x : rest') ->
         let v = case x of VString _ -> 1; _ -> 0
-        in pure (conf { stk = VInt v : rest' }, rest)
+        in pure (conf { stk = VInt v : rest' }, nextAddress)
       _ -> throwSM "PATT String: stack underflow"
     PSexp -> case stk conf of
       (x : rest') ->
         let v = case x of VSexp _ _ -> 1; _ -> 0
-        in pure (conf { stk = VInt v : rest' }, rest)
+        in pure (conf { stk = VInt v : rest' }, nextAddress)
       _ -> throwSM "PATT Sexp: stack underflow"
     Boxed -> case stk conf of
       (x : rest') ->
         let v = case x of VInt _ -> 0; _ -> 1
-        in pure (conf { stk = VInt v : rest' }, rest)
+        in pure (conf { stk = VInt v : rest' }, nextAddress)
       _ -> throwSM "PATT Boxed: stack underflow"
     UnBoxed -> case stk conf of
       (x : rest') ->
         let v = case x of VInt _ -> 1; _ -> 0
-        in pure (conf { stk = VInt v : rest' }, rest)
+        in pure (conf { stk = VInt v : rest' }, nextAddress)
       _ -> throwSM "PATT UnBoxed: stack underflow"
     PClosure -> case stk conf of
       (x : rest') ->
         let v = case x of VClosure{} -> 1; _ -> 0
-        in pure (conf { stk = VInt v : rest' }, rest)
+        in pure (conf { stk = VInt v : rest' }, nextAddress)
       _ -> throwSM "PATT Closure: stack underflow"
 
   FAIL l -> case stk conf of
-    (x : _) -> throwSM ("matching value " ++ showValue (store conf) x
+    (x : _) -> throwSM ("matching value " ++ showValue program conf x
                         ++ " failed at " ++ show l)
     _       -> throwSM "FAIL: empty stack"
 
-jumpTo :: LabelEnv -> String -> SM Prog
-jumpTo env l = case M.lookup l env of
-  Just p  -> pure p
-  Nothing -> throwSM ("undefined label: " ++ l)
+returnFromCall :: Prog -> Config -> SM (Config, Int)
+returnFromCall program state = case cstack state of
+  (returnAddress, callerLocals, _) : remainingFrames ->
+    pure (state { cstack = remainingFrames, loc = callerLocals }, returnAddress)
+  [] -> pure (state, IM.size (programInstructions program))
+
+jumpTo :: Prog -> Int -> SM Int
+jumpTo program targetAddress
+  | IM.member targetAddress (programInstructions program) = Right targetAddress
+  | otherwise = throwSM ("Invalid instruction address: " ++ show targetAddress)
 
 capture :: Config -> Designation -> SM Value
 capture state designation = case designation of
   DGlobal _ -> throwSM "CLOSURE: bad designation"
   _ -> lookupDesignation state designation
 
-eval :: LabelEnv -> Config -> Prog -> SM Config
-eval env conf [] = pure conf
-eval env conf prog = do
-  -- traceM ("SM TRACE next=" ++ show (take 1 prog) ++ " stack=" ++ show (stk conf) ++ " globals=" ++ show (glob conf) ++ " output=" ++ show (out conf) ++ " locals=" ++ show (loc conf) ++ " heap=" ++ show (store conf)) -- DEBUG
-  (conf', prog') <- step env conf prog
-  eval env conf' prog'
+eval :: Prog -> Config -> Int -> SM Config
+eval program state instructionAddress
+  | finished program instructionAddress = pure state
+  | otherwise = do
+      -- traceM ("SM TRACE next=" ++ show (currentInstruction program instructionAddress) ++ " state=" ++ show state) -- DEBUG
+      (nextState, nextAddress) <- step program state instructionAddress
+      eval program nextState nextAddress
 
 run :: Prog -> [Int] -> Either String [Int]
-run p i =
-  let (env, conf0) = initialState p i
-  in fmap out (eval env conf0 p)
+run program inputs = out <$> runConfig program inputs
 
 runConfig :: Prog -> [Int] -> Either String Config
-runConfig p i =
-  let (env, conf0) = initialState p i
-  in eval env conf0 p
+runConfig program inputs = do
+  entryState <- initialState program inputs
+  eval program entryState (programEntry program)

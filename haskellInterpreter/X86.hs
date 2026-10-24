@@ -37,7 +37,7 @@ data Instr
   | Dec Opnd | Or1 Opnd | Sal1 Opnd | Sar1 Opnd | Repmovsl
   deriving (Eq, Show)
 
-type ExtInst = (Instr, Maybe String)
+type ExtInst = (Instr, Maybe (Int, String))
 
 data MemObject
   = MemArray   [Int]
@@ -340,7 +340,7 @@ dispatchBuiltin cfg name st0 = case name of
   "write" -> do
     argument <- readInt st0 (R RDI)
     outputValue <- unboxInteger "write" argument
-    writeInt (st0 { stOutput = stOutput st0 ++ [outputValue] }) (R RAX) 0
+    writeInt (st0 { stOutput = stOutput st0 ++ [outputValue] }) (R RAX) 1
 
   "length" -> do
     objectAddress <- readInt st0 (R RDI)
