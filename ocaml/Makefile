@@ -5,7 +5,7 @@ OCAMLDEP = ocamlfind dep
 SOURCES = SM_ocanren.ml 
 CAMLP5 = -syntax camlp5o -package GT.syntax,GT.syntax.all,OCanren.syntax 
 PXFLAGS = $(CAMLP5)
-BFLAGS = -i -rectypes -g -package GT,OCanren 
+BFLAGS = -rectypes -g -package GT,OCanren 
 OFLAGS = $(BFLAGS) -inline 10
 
 all:.depend $(TOPFILE)
