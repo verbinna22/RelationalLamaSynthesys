@@ -213,28 +213,133 @@ module Insn =
     
   end
 
+module Prog =
+  struct
+
+    @type ('insn, 'int, 'pair) prog_a = MkProg of 'insn * 'int * 'pair with show, gmap
+
+    @type t     = (Insn.t list, int, (int * string) list) prog_a               with show
+    @type logic = (Insn.logic Std.List.logic, Std.Nat.logic, (Std.Nat.logic, Std.String.logic) Std.Pair.logic Std.List.logic) prog_a OCanren.logic with show
+
+    let fmapt fil fe fifn subj =
+      let open Env.Monad in
+      return (gmap(prog_a)) <*> fil <*> fe <*> fifn <*> subj
+
+    let prj_exn =
+      let open Env.Monad in
+      Reifier.fix
+        (fun self -> prj_exn <..>
+           (chain (fmapt
+              (Std.List.prj_exn Insn.prj_exn)
+              (fun env x -> Std.Nat.to_int @@ Std.Nat.prj_exn env x)
+              (Std.List.prj_exn (Std.Pair.prj_exn
+                 (fun env x -> Std.Nat.to_int @@ Std.Nat.prj_exn env x)
+                 Std.String.prj_exn)))))
+
+    let reify =
+      let open Env.Monad in
+      Reifier.fix
+        (fun self -> reify <..>
+           (chain (Reifier.zed
+              (Reifier.rework ~fv:(fmapt
+                 (Std.List.reify Insn.reify)
+                 Std.Nat.reify
+                 (Std.List.reify (Std.Pair.reify Std.Nat.reify Std.String.reify)))))))
+
+    let finished program instructionAddress =
+      let open Std.List in
+      ocanren {
+        fresh instructions, addr, env in
+          program == MkProg (instructions, addr, env) &
+        lengtho instructions instructionAddress
+      }
+
+    let make instructions entry functionNames =
+      inj @@ MkProg (instructions, entry, functionNames)
+
+  end
+
+
 module Test =
   struct
 
     let test printer reifier goal () =
       Printf.printf "%s\n" (show(list) (show(printer)) @@ (Stream.take @@ run q goal (fun qs -> qs#reify reifier)))
-        
     let tests_prj_exn = [
         test Patt       .t Patt       .prj_exn (fun q -> ocanren {q == Patt.StrCmp | q == Patt.Sexp});
         test Designation.t Designation.prj_exn (fun q -> ocanren {q == Designation.Local 3});
         test Value      .t Value      .prj_exn (fun q -> ocanren {q == Value.Empty});
-        test Insn       .t Insn       .prj_exn (fun q -> ocanren {q == Insn.RET})
+        test Insn       .t Insn       .prj_exn (fun q -> ocanren {q == Insn.RET});
+        test Designation.t Designation.prj_exn (fun q -> ocanren {
+          q == Designation.Global !(OCanren.inj "main")
+        });
+        test Prog.t Prog.prj_exn (fun q -> ocanren {
+          q == Prog.MkProg ([Insn.CONST 1; Insn.RET], 0, [(0, !(OCanren.inj "main"))])
+        })
     ]
     
     let tests_reify = [
         test Patt       .logic Patt       .reify (fun q -> ocanren {q == Patt.StrCmp | q == Patt.Sexp});
         test Designation.logic Designation.reify (fun q -> ocanren {q == Designation.Local 3});
         test Value      .logic Value      .reify (fun q -> ocanren {q == Value.Empty});
-        test Insn       .logic Insn       .reify (fun q -> ocanren {q == Insn.RET})
+        test Insn       .logic Insn       .reify (fun q -> ocanren {q == Insn.RET});
+        test Designation.logic Designation.reify (fun q -> ocanren {
+          q == Designation.Global !(OCanren.inj "main")
+        });
+        test Prog.logic Prog.reify (fun q -> ocanren {
+          q == Prog.MkProg ([Insn.CONST 1; Insn.RET], 0, [(0, !(OCanren.inj "main"))])
+        })
       ]
+    
+    (* let test_finished () =
+      let open Prog in
+      let g q = ocanren { finished {
+          programInstructions  = [Insn.CONST 1; Insn.RET];
+          programEntry         = 0;
+          programFunctionNames = [];
+        } q } in
+      Printf.printf "finished 2 = %s\n"
+        (show(list) (show(show(int)) @@ (Stream.take @@ run q (g q) (fun qs -> qs#reify (Std.List.reify Std.Nat.reify))))) *)
+    
+        (* let test_finished () =
+          let open Prog in
+          let open Std.List in
+          let prog_l : Prog.logic =
+            inj @@ ({ programInstructions  = [Insn.CONST 1; Insn.RET];
+                      programEntry         = 0;
+                      programFunctionNames = [(0, "main")];
+                    } : Prog.t)
+          in
+          let g q = ocanren { finished prog_l q } in
+          Printf.printf "finished 2 = %s\n"
+            (show(list) (show Std.Nat.t) @@
+              (Stream.take @@
+                  run q (g q) (fun qs -> qs#reify Std.Nat.reify))) *)
+    let test_finished () =
+      let g q =
+        ocanren {
+          Prog.finished (Prog.MkProg ([Insn.CONST 1; Insn.RET], 0, [])) q
+        }
+    in
+      Printf.printf "finished 2 = %s\n"
+    (show(list) (fun n -> string_of_int (OCanren.Std.Nat.to_int n)) @@
+      (Stream.take @@
+          run q g (fun qs -> qs#reify Std.Nat.prj_exn)))
+
+    let test_finished_2 () =
+      let g prog =
+      ocanren {
+        Prog.finished prog 2
+      }
+  in
+      Printf.printf "program for address 2 = %s\n"
+    (show(Prog.logic) @@
+      (Stream.hd @@
+          run q g (fun rr -> rr#reify Prog.reify)))
 
     let run_test =
       List.iter (fun t -> t ()) tests_prj_exn;
-      List.iter (fun t -> t ()) tests_reify
-    
+      List.iter (fun t -> t ()) tests_reify;
+      test_finished ();
+      test_finished_2 ()
   end
