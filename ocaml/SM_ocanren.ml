@@ -259,6 +259,139 @@ module Prog =
 
   end
 
+module Loc = struct
+  @type ('args, 'locals, 'closure) loc_a = 
+    | Loc of 'args * 'locals * 'closure
+  with show, gmap
+
+  @type t = ((int * Value.t) list, (int * Value.t) list, int Std.Option.t) loc_a with show
+  @type logic = ((Std.Nat.logic, Value.logic) Std.Pair.logic Std.List.logic, 
+                 (Std.Nat.logic, Value.logic) Std.Pair.logic Std.List.logic, 
+                 Std.Nat.logic Std.Option.logic) loc_a OCanren.logic with show
+
+  let fmapt fa fl fc subj =
+    let open Env.Monad in
+    return (gmap(loc_a)) <*> fa <*> fl <*> fc <*> subj
+
+  let prj_exn env =
+    let open Env.Monad in
+    Reifier.fix (fun self ->
+      prj_exn <..> (chain (fmapt (Std.List.prj_exn (Std.Pair.prj_exn 
+                                                      (fun env x -> Std.Nat.to_int @@ Std.Nat.prj_exn env x)
+                                                      Value.prj_exn))
+                                 (Std.List.prj_exn (Std.Pair.prj_exn 
+                                                      (fun env x -> Std.Nat.to_int @@ Std.Nat.prj_exn env x)
+                                                      Value.prj_exn))
+                                 (Std.Option.prj_exn (fun env x -> Std.Nat.to_int @@ Std.Nat.prj_exn env x))
+                          ))) env
+
+  let reify env =
+    let open Env.Monad in
+    Reifier.fix (fun self ->
+      reify <..> (chain (Reifier.zed (Reifier.rework ~fv:(fmapt (Std.List.reify (Std.Pair.reify Std.Nat.reify Value.reify))
+                                                              (Std.List.reify (Std.Pair.reify Std.Nat.reify Value.reify))
+                                                              (Std.Option.reify Std.Nat.reify)))))) env
+  let loc args locals closure = inj @@ Loc (args, locals, closure)
+end
+
+module Frame = struct
+  @type ('int, 'loc, 'values) frame_a = Frame of 'int * 'loc * 'values with show, gmap
+  
+  @type t = (int, Loc.t, Value.t list) frame_a with show
+  @type logic = (Std.Nat.logic, Loc.logic, Value.logic Std.List.logic) frame_a OCanren.logic with show
+
+  let fmapt fi fl fv subj =
+    let open Env.Monad in
+    return (gmap(frame_a)) <*> fi <*> fl <*> fv <*> subj
+
+  let prj_exn env =
+    let open Env.Monad in
+    Reifier.fix (fun self ->
+      prj_exn <..> (chain (fmapt (fun env x -> Std.Nat.to_int @@ Std.Nat.prj_exn env x)
+                                 Loc.prj_exn
+                                 (Std.List.prj_exn Value.prj_exn)))) env
+
+  let reify env =
+    let open Env.Monad in
+    Reifier.fix (fun self ->
+      reify <..> (chain (Reifier.zed (Reifier.rework ~fv:(fmapt Std.Nat.reify
+                                                              Loc.reify
+                                                              (Std.List.reify Value.reify)))))) env
+
+  let frame i l v = inj @@ Frame (i, l, v)
+end
+
+module Store = struct
+  @type 'a t_a = Store of 'a with show, gmap
+  
+  @type t = (int * Value.t list) list t_a with show
+  @type logic = (Std.Nat.logic, Value.logic Std.List.logic) Std.Pair.logic Std.List.logic t_a OCanren.logic with show
+
+  let fmapt fs subj =
+    let open Env.Monad in
+    return (gmap(t_a)) <*> fs <*> subj
+
+  let prj_exn env =
+    let open Env.Monad in
+    Reifier.fix (fun self ->
+      prj_exn <..> (chain (fmapt (Std.List.prj_exn (Std.Pair.prj_exn 
+                                                      (fun env x -> Std.Nat.to_int @@ Std.Nat.prj_exn env x)
+                                                      (Std.List.prj_exn Value.prj_exn)))))) env
+
+  let reify env =
+    let open Env.Monad in
+    Reifier.fix (fun self ->
+      reify <..> (chain (Reifier.zed (Reifier.rework ~fv:(fmapt (Std.List.reify (Std.Pair.reify Std.Nat.reify (Std.List.reify Value.reify)))))))) env
+
+  let store pairs = inj @@ Store pairs
+end
+
+module Config = struct
+  @type ('frames, 'stk, 'glob, 'loc, 'inp, 'out, 'store, 'nextId) config_a = 
+    | Config of 'frames * 'stk * 'glob * 'loc * 'inp * 'out * 'store * 'nextId
+  with show, gmap
+
+  @type t = (Frame.t list, Value.t list, (string * Value.t) list, Loc.t, int list, int list, Store.t, int) config_a with show
+  @type logic = (Frame.logic Std.List.logic, 
+                 Value.logic Std.List.logic, 
+                 (Std.String.logic, Value.logic) Std.Pair.logic Std.List.logic, 
+                 Loc.logic, 
+                 Std.Nat.logic Std.List.logic, 
+                 Std.Nat.logic Std.List.logic, 
+                 Store.logic, 
+                 Std.Nat.logic) config_a OCanren.logic with show
+
+  let fmapt ff fs fg fl fi fo fst fn subj =
+    let open Env.Monad in
+    return (gmap(config_a)) <*> ff <*> fs <*> fg <*> fl <*> fi <*> fo <*> fst <*> fn <*> subj
+
+  let prj_exn env =
+    let open Env.Monad in
+    Reifier.fix (fun self ->
+      prj_exn <..> (chain (fmapt (Std.List.prj_exn Frame.prj_exn)
+                                 (Std.List.prj_exn Value.prj_exn)
+                                 (Std.List.prj_exn (Std.Pair.prj_exn Std.String.prj_exn Value.prj_exn))
+                                 Loc.prj_exn
+                                 (Std.List.prj_exn (fun env x -> Std.Nat.to_int @@ Std.Nat.prj_exn env x))
+                                 (Std.List.prj_exn (fun env x -> Std.Nat.to_int @@ Std.Nat.prj_exn env x))
+                                 Store.prj_exn
+                                 (fun env x -> Std.Nat.to_int @@ Std.Nat.prj_exn env x)))) env
+
+  let reify env =
+    let open Env.Monad in
+    Reifier.fix (fun self ->
+      reify <..> (chain (Reifier.zed (Reifier.rework ~fv:(fmapt (Std.List.reify Frame.reify)
+                                                              (Std.List.reify Value.reify)
+                                                              (Std.List.reify (Std.Pair.reify Std.String.reify Value.reify))
+                                                              Loc.reify
+                                                              (Std.List.reify Std.Nat.reify)
+                                                              (Std.List.reify Std.Nat.reify)
+                                                              Store.reify
+                                                              Std.Nat.reify))))) env
+
+  let config cstack stk glob loc inp out store nextId = 
+    inj @@ Config (cstack, stk, glob, loc, inp, out, store, nextId)
+end
 
 module Test =
   struct
@@ -291,30 +424,6 @@ module Test =
         })
       ]
     
-    (* let test_finished () =
-      let open Prog in
-      let g q = ocanren { finished {
-          programInstructions  = [Insn.CONST 1; Insn.RET];
-          programEntry         = 0;
-          programFunctionNames = [];
-        } q } in
-      Printf.printf "finished 2 = %s\n"
-        (show(list) (show(show(int)) @@ (Stream.take @@ run q (g q) (fun qs -> qs#reify (Std.List.reify Std.Nat.reify))))) *)
-    
-        (* let test_finished () =
-          let open Prog in
-          let open Std.List in
-          let prog_l : Prog.logic =
-            inj @@ ({ programInstructions  = [Insn.CONST 1; Insn.RET];
-                      programEntry         = 0;
-                      programFunctionNames = [(0, "main")];
-                    } : Prog.t)
-          in
-          let g q = ocanren { finished prog_l q } in
-          Printf.printf "finished 2 = %s\n"
-            (show(list) (show Std.Nat.t) @@
-              (Stream.take @@
-                  run q (g q) (fun qs -> qs#reify Std.Nat.reify))) *)
     let test_finished () =
       let g q =
         ocanren {
