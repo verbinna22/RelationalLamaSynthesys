@@ -8,6 +8,39 @@ let expect_words description expected goal =
       (String.concat "; " (List.map string_of_int expected))
       (String.concat "; " (List.map string_of_int actual)))
 
+let expect_ranges description expected answers =
+  let interval answer =
+    let rec read index fixed seen minimum maximum = function
+      | Value Std.List.Nil ->
+          assert (index = Word32.width);
+          (minimum, maximum)
+      | Value (Std.List.Cons (bit, tail)) ->
+          assert (index < Word32.width);
+          let weight = 1 lsl index in
+          (match bit with
+           | Value bit ->
+               read (index + 1) true seen
+                 (if bit then minimum lor weight else minimum)
+                 (if bit then maximum lor weight else maximum) tail
+           | Var (id, []) ->
+               assert (not fixed && not (List.mem id seen));
+               read (index + 1) false (id :: seen) minimum (maximum lor weight) tail
+           | _ -> failwith (description ^ ": constrained bit in a range"))
+      | _ -> failwith (description ^ ": incomplete word")
+    in
+    read 0 false [] 0 0 answer
+  in
+  let intervals = List.sort compare (List.map interval answers) in
+  let merged = List.fold_left (fun ranges (minimum, maximum) ->
+    match ranges with
+    | (previous_minimum, previous_maximum) :: rest ->
+        if minimum <= previous_maximum then failwith (description ^ ": overlapping answers");
+        if minimum = previous_maximum + 1 then (previous_minimum, maximum) :: rest
+        else (minimum, maximum) :: ranges
+    | [] -> [(minimum, maximum)]
+  ) [] intervals in
+  if List.rev merged <> expected then failwith (description ^ ": unexpected ranges")
+
 let test_conversions () =
   List.iter (fun value ->
     let bits = Word32.of_int value in
@@ -146,6 +179,99 @@ let test_backwards () =
     (fun right -> Word32.mulo (Word32.word 2) right (Word32.word 1));
   Printf.printf "Word32 backward arithmetic: unique, multiple and absent solutions OK\n%!"
 
+let test_comparisons () =
+  let samples = [0; 1; 2; 3; 31; 0x10001; 0x7fff_ffff;
+                 0x8000_0000; 0xaaaa_aaaa; 0xffff_ffff] in
+  List.iter (fun left ->
+    List.iter (fun right ->
+      List.iter (fun (relation, expected) ->
+        let actual = Stream.take @@ run q (relation (Word32.word left) (Word32.word right))
+          (fun answer -> answer#reify Std.Bool.prj_exn) in
+        assert (actual = [expected])
+      ) [(Word32.lto, left < right); (Word32.gto, left > right); (Word32.eqo, left = right)]
+    ) samples
+  ) samples;
+  Printf.printf "Word32 comparisons: %d unsigned reference cases OK\n%!"
+    (3 * List.length samples * List.length samples)
+
+let test_comparisons_backwards () =
+  let check description expected goal =
+    let answers = Stream.take @@ run q goal (fun answer -> answer#reify Word32.reify) in
+    expect_ranges description expected answers
+  in
+  let maximum = Word32.max_value in
+  check "less than 3" [(0, 2)]
+    (fun value -> Word32.lto value (Word32.word 3) (inj true));
+  check "greater than 3" [(4, maximum)]
+    (fun value -> Word32.gto value (Word32.word 3) (inj true));
+  check "right operand greater than 3" [(4, maximum)]
+    (fun value -> Word32.lto (Word32.word 3) value (inj true));
+  check "right operand less than 3" [(0, 2)]
+    (fun value -> Word32.gto (Word32.word 3) value (inj true));
+  check "not less than 3" [(3, maximum)]
+    (fun value -> Word32.lto value (Word32.word 3) (inj false));
+  check "not greater than 3" [(0, 3)]
+    (fun value -> Word32.gto value (Word32.word 3) (inj false));
+  check "not equal to 3" [(0, 2); (4, maximum)]
+    (fun value -> Word32.eqo value (Word32.word 3) (inj false));
+  expect_words "equal to maximum" [maximum]
+    (fun value -> Word32.eqo value (Word32.word maximum) (inj true));
+  check "less than zero" []
+    (fun value -> Word32.lto value (Word32.word 0) (inj true));
+  check "greater than maximum" []
+    (fun value -> Word32.gto value (Word32.word maximum) (inj true));
+  check "not less than maximum" [(maximum, maximum)]
+    (fun value -> Word32.lto value (Word32.word maximum) (inj false));
+  check "not greater than zero" [(0, 0)]
+    (fun value -> Word32.gto value (Word32.word 0) (inj false));
+  check "self equality" [(0, maximum)]
+    (fun value -> Word32.eqo value value (inj true));
+  check "self inequality" []
+    (fun value -> Word32.eqo value value (inj false));
+  check "self less than" []
+    (fun value -> Word32.lto value value (inj true));
+  check "self not less than" [(0, maximum)]
+    (fun value -> Word32.lto value value (inj false));
+  Printf.printf "Word32 inverse comparisons: exact ranges, boundaries and shared variables OK\n%!"
+
+let expect_division description ~dividend ~divisor expected =
+  let number_prj = Reifier.fmap Word32.to_int Word32.prj_exn in
+  let actual = Stream.take @@ run q (fun answer -> ocanren {
+    fresh quotient, remainder in
+      Word32.divmodo !(Word32.word dividend) !(Word32.word divisor) quotient remainder &
+      answer == Std.pair quotient remainder
+  }) (fun answer -> answer#reify (Std.Pair.prj_exn number_prj number_prj)) in
+  let show_pair (quotient, remainder) = Printf.sprintf "(%d, %d)" quotient remainder in
+  if actual <> expected then
+    failwith (Printf.sprintf "Word32 %s: expected [%s], got [%s]" description
+      (String.concat "; " (List.map show_pair expected))
+      (String.concat "; " (List.map show_pair actual)))
+
+let test_division () =
+  expect_division "zero dividend" ~dividend:0 ~divisor:7 [(0, 0)];
+  expect_division "division by one" ~dividend:7 ~divisor:1 [(7, 0)];
+  expect_division "dividend smaller than divisor" ~dividend:7 ~divisor:9 [(0, 7)];
+  expect_division "quotient with a remainder" ~dividend:17 ~divisor:5 [(3, 2)];
+  expect_division "maximum divided by two" ~dividend:0xffff_ffff ~divisor:2 [(0x7fff_ffff, 1)];
+  expect_division "divisor with the top bit set" ~dividend:0xffff_ffff ~divisor:0x8000_0000 [(1, 0x7fff_ffff)];
+  expect_division "divisor above the midpoint" ~dividend:0xffff_ffff ~divisor:0x8000_0001 [(1, 0x7fff_fffe)];
+  expect_division "neighbouring large words" ~dividend:0xffff_ffff ~divisor:0xffff_fffe [(1, 1)];
+  expect_division "equal maximum words" ~dividend:0xffff_ffff ~divisor:0xffff_ffff [(1, 0)];
+  expect_division "zero divided by zero has no solution" ~dividend:0 ~divisor:0 [];
+  expect_division "nonzero divided by zero has no solution" ~dividend:7 ~divisor:0 [];
+  Printf.printf "Word32 division: quotient, remainder, unsigned boundaries and zero divisor OK\n%!"
+
+let test_division_backwards () =
+  expect_words "recover dividend from 5 * 3 + 2" [17] (fun dividend ->
+    Word32.divmodo dividend (Word32.word 5) (Word32.word 3) (Word32.word 2));
+  expect_words "recover divisor from 17 = divisor * 3 + 2" [5] (fun divisor ->
+    Word32.divmodo (Word32.word 17) divisor (Word32.word 3) (Word32.word 2));
+  expect_words "recover maximum divisor" [0xffff_ffff] (fun divisor ->
+    Word32.divmodo (Word32.word 0xffff_ffff) divisor (Word32.word 1) (Word32.word 0));
+  expect_words "remainder must be smaller than the divisor" [] (fun dividend ->
+    Word32.divmodo dividend (Word32.word 5) (Word32.word 3) (Word32.word 5));
+  Printf.printf "Word32 inverse division: either operand and impossible remainder OK\n%!"
+
 let test_invalid_widths () =
   List.iter (fun count ->
     let malformed = Std.list inj (List.init count (fun _ -> false)) in
@@ -155,6 +281,22 @@ let test_invalid_widths () =
       expect_words "invalid result width" [] (fun left ->
         ocanren { left == !(Word32.word 0) & operation left !(Word32.word 0) malformed })
     ) [Word32.addo; Word32.subo; Word32.mulo];
+    List.iter (fun relation ->
+      let left = Stream.take @@ run q (relation malformed (Word32.word 0))
+        (fun answer -> answer#reify Std.Bool.prj_exn) in
+      let right = Stream.take @@ run q (relation (Word32.word 0) malformed)
+        (fun answer -> answer#reify Std.Bool.prj_exn) in
+      assert (left = [] && right = [])
+    ) [Word32.lto; Word32.gto; Word32.eqo];
+    let malformed_nonzero = Std.list inj (List.init count (fun index -> index = 0)) in
+    expect_words "invalid dividend width" [] (fun quotient ->
+      Word32.divmodo malformed (Word32.word 1) quotient (Word32.word 0));
+    expect_words "invalid nonzero divisor width" [] (fun quotient ->
+      Word32.divmodo (Word32.word 0) malformed_nonzero quotient (Word32.word 0));
+    expect_words "invalid quotient width" [] (fun remainder ->
+      Word32.divmodo (Word32.word 0) (Word32.word 1) malformed remainder);
+    expect_words "invalid remainder width" [] (fun quotient ->
+      Word32.divmodo (Word32.word 0) (Word32.word 1) quotient malformed);
     let naturals = Stream.take @@ run q (Word32.to_nato malformed)
       (fun answer -> answer#reify Std.Nat.reify) in
     assert (naturals = [])
@@ -167,4 +309,8 @@ let run_tests () =
   test_nat ();
   test_arithmetic ();
   test_backwards ();
+  test_comparisons ();
+  test_comparisons_backwards ();
+  test_division ();
+  test_division_backwards ();
   test_invalid_widths ()

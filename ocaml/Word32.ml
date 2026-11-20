@@ -2,7 +2,7 @@ open GT
 open OCanren
 
 @type t = bool list with show
-@type logic = Std.Bool.logic Std.List.logic with show
+@type logic = Std.Bool.logic Std.List.logic with show, gmap
 type injected = bool ilogic Std.List.groundi
 
 let width = 32
@@ -67,6 +67,34 @@ let addo left right sum =
 
 let subo left right difference = addo right difference left
 
+let rec compare_bitso count left right less equal =
+  if count = 0 then ocanren {
+    left == [] & right == [] & less == false & equal == true
+  }
+  else ocanren {
+    fresh left_bit, left_tail, right_bit, right_tail, higher_less, higher_equal in
+      left == left_bit :: left_tail &
+      right == right_bit :: right_tail &
+      compare_bitso !(count - 1) left_tail right_tail higher_less higher_equal &
+      {higher_equal == false & less == higher_less & equal == false |
+       higher_equal == true &
+       {left_bit == right_bit & less == false & equal == true |
+        left_bit == false & right_bit == true & less == true & equal == false |
+        left_bit == true & right_bit == false & less == false & equal == false}}
+  }
+
+let lto left right less =
+  ocanren {
+    fresh equal in compare_bitso width left right less equal
+  }
+
+let gto left right greater = lto right left greater
+
+let eqo left right equal =
+  ocanren {
+    fresh less in compare_bitso width left right less equal
+  }
+
 let rec halveo natural half odd =
   ocanren {
     natural == 0 & half == 0 & odd == false |
@@ -78,6 +106,32 @@ let rec halveo natural half odd =
   }
 
 let wordo (bits : injected) = Std.List.lengtho bits (Std.nat width)
+
+let rec div_bitso count dividend divisor quotient remainder =
+  if count = 0 then ocanren {
+    dividend == [] & quotient == [] & remainder == !(word 0)
+  }
+  else ocanren {
+    fresh dividend_bit, dividend_tail, quotient_bit, quotient_tail,
+          previous_remainder, shifted_remainder, extended_remainder, less, equal in
+      dividend == dividend_bit :: dividend_tail &
+      quotient == quotient_bit :: quotient_tail &
+      wordo remainder & Std.List.appendo remainder [false] extended_remainder &
+      div_bitso !(count - 1) dividend_tail divisor quotient_tail previous_remainder &
+      shifted_remainder == dividend_bit :: previous_remainder &
+      compare_bitso !(width + 1) shifted_remainder divisor less equal &
+      {less == true & quotient_bit == false & extended_remainder == shifted_remainder |
+       less == false & quotient_bit == true &
+       add_bitso !(width + 1) false divisor extended_remainder shifted_remainder}
+  }
+
+let divmodo dividend divisor quotient remainder =
+  ocanren {
+    fresh extended_divisor in
+      gto divisor !(word 0) true &
+      Std.List.appendo divisor [false] extended_divisor &
+      div_bitso width dividend extended_divisor quotient remainder
+  }
 
 let rec sum_productso left right total sum =
   ocanren {
